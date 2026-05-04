@@ -2220,6 +2220,17 @@ void loop()
   bleKbTask();
   checkInput();
 
+  // Status-bar overlay for BLE pairing state. Edge-triggered so we
+  // only redraw on entry/exit, not every loop iteration.
+  static bool prevPairingMode = false;
+  bool nowPairing = BleHidHost::inPairingMode();
+  if (nowPairing != prevPairingMode)
+  {
+    if (nowPairing) showStatus("** BLE PAIRING - PUT KEYBOARD IN PAIR MODE **");
+    else            showStatus("");
+    prevPairingMode = nowPairing;
+  }
+
   if (inputReady)
   {
     processInput(inputBuf);
