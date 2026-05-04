@@ -21,6 +21,40 @@ class ExprParser
 public:
   ExprParser(VarTable* vars) : m_vars(vars) {}
 
+  // File I/O hook — only EOF() uses it. Wired by TokenParser.
+  typedef bool (*FileEofFn)(int unit);
+  void setFileEof(FileEofFn f) { m_fileEof = f; }
+
+  // --- Diagnostic signaling (warnings + errors) ---
+  enum Severity : uint8_t { DS_NONE = 0, DS_WARNING = 1, DS_ERROR = 2 };
+
+  bool hasError()    const { return m_severity == DS_ERROR; }
+  bool hasWarning()  const { return m_severity == DS_WARNING; }
+  bool hasDiag()     const { return m_severity != DS_NONE; }
+  Severity severity() const { return m_severity; }
+  const char* errorMsg() const { return m_errorMsg; }
+  void clearError() { m_severity = DS_NONE; m_errorMsg[0] = '\0'; }
+
+  void setError(const char* msg)   { recordDiag(DS_ERROR, msg); }
+  void setWarning(const char* msg) { recordDiag(DS_WARNING, msg); }
+
+private:
+  void recordDiag(Severity sev, const char* msg)
+  {
+    // Errors supersede warnings; first of each severity wins.
+    if (sev <= m_severity && m_severity != DS_NONE) return;
+    m_severity = sev;
+    int n = 0;
+    while (msg[n] && n < (int)sizeof(m_errorMsg) - 1)
+    {
+      m_errorMsg[n] = msg[n];
+      n++;
+    }
+    m_errorMsg[n] = '\0';
+  }
+
+public:
+
   // Evaluate a numeric expression, advancing pos through the token stream
   float evalNumeric(const uint8_t* tokens, int* pos)
   {
@@ -60,6 +94,9 @@ public:
 
 private:
   VarTable* m_vars;
+  Severity m_severity = DS_NONE;
+  char     m_errorMsg[40] = {0};
+  FileEofFn m_fileEof = NULL;
 
   // --- String term evaluator ---
 
@@ -87,6 +124,36 @@ private:
       char fname[16];
       int peekLen = peekIdent(tokens, *pos, fname, sizeof(fname));
       bool isFunctionCall = (tokens[*pos + peekLen] == TOK_LPAREN);
+
+      // User-defined string function? Name must start with "FN" and end
+      // with "$" (fnIsStr=true in the stored definition).
+      if (isFunctionCall && peekLen >= 3 &&
+          (fname[0] == 'F' || fname[0] == 'f') &&
+          (fname[1] == 'N' || fname[1] == 'n') &&
+          fname[peekLen - 1] == '$')
+      {
+        FnDef* fn = m_vars->findFn(fname, peekLen);
+        if (fn != NULL && fn->isStringFn)
+        {
+          *pos += peekLen;
+          if (tokens[*pos] == TOK_LPAREN) (*pos)++;
+          if (fn->isStringParam)
+          {
+            char argBuf[MAX_STR_LEN];
+            evalString(tokens, pos, argBuf, sizeof(argBuf));
+            m_vars->setStr(fn->param, fn->paramLen, argBuf);
+          }
+          else
+          {
+            float arg = evalNumeric(tokens, pos);
+            m_vars->setNum(fn->param, fn->paramLen, arg);
+          }
+          if (tokens[*pos] == TOK_RPAREN) (*pos)++;
+          int bodyPos = 0;
+          evalString(fn->body, &bodyPos, buf, bufSize);
+          return;
+        }
+      }
 
       if (isFunctionCall)
       {
@@ -209,43 +276,83 @@ private:
     buf[0] = '\0';
   }
 
-  // Comparison: expr (= <> < > <= >=) expr
+  // Logical OR (lowest precedence of the logical ops)
   float evalComparison(const uint8_t* tokens, int* pos)
+  {
+    float left = evalAnd(tokens, pos);
+    while (tokens[*pos] == TOK_OR)
+    {
+      (*pos)++;
+      float right = evalAnd(tokens, pos);
+      left = (left != 0 || right != 0) ? -1 : 0;
+    }
+    return left;
+  }
+
+  // Logical AND (precedence above OR)
+  float evalAnd(const uint8_t* tokens, int* pos)
+  {
+    float left = evalXor(tokens, pos);
+    while (tokens[*pos] == TOK_AND)
+    {
+      (*pos)++;
+      float right = evalXor(tokens, pos);
+      left = (left != 0 && right != 0) ? -1 : 0;
+    }
+    return left;
+  }
+
+  // Logical XOR (precedence above AND)
+  float evalXor(const uint8_t* tokens, int* pos)
+  {
+    float left = evalRelational(tokens, pos);
+    while (tokens[*pos] == TOK_XOR)
+    {
+      (*pos)++;
+      float right = evalRelational(tokens, pos);
+      left = ((left != 0) ^ (right != 0)) ? -1 : 0;
+    }
+    return left;
+  }
+
+  // Relational: expr (= <> < > <= >=) expr
+  //
+  // TI encodes compound ops as two tokens:
+  //   <=  →  TOK_LESS + TOK_EQUAL
+  //   >=  →  TOK_GREATER + TOK_EQUAL
+  //   <>  →  TOK_LESS + TOK_GREATER
+  enum CmpOp { CMP_NONE, CMP_EQ, CMP_NE, CMP_LT, CMP_GT, CMP_LE, CMP_GE };
+
+  float evalRelational(const uint8_t* tokens, int* pos)
   {
     float left = evalAddSub(tokens, pos);
 
-    uint8_t tok = tokens[*pos];
-    if (tok == TOK_EQUAL || tok == TOK_NOT_EQUAL ||
-        tok == TOK_LESS || tok == TOK_GREATER ||
-        tok == TOK_LESS_EQ || tok == TOK_GREATER_EQ)
-    {
-      (*pos)++;
-      float right = evalAddSub(tokens, pos);
-      switch (tok)
-      {
-        case TOK_EQUAL:      return (left == right) ? -1 : 0;
-        case TOK_NOT_EQUAL:  return (left != right) ? -1 : 0;
-        case TOK_LESS:       return (left < right) ? -1 : 0;
-        case TOK_GREATER:    return (left > right) ? -1 : 0;
-        case TOK_LESS_EQ:    return (left <= right) ? -1 : 0;
-        case TOK_GREATER_EQ: return (left >= right) ? -1 : 0;
-      }
-    }
+    uint8_t tok  = tokens[*pos];
+    uint8_t tok2 = tokens[(*pos) + 1];
+    CmpOp op = CMP_NONE;
+    int consumed = 0;
 
-    // Logical operators
-    if (tok == TOK_AND)
-    {
-      (*pos)++;
-      float right = evalComparison(tokens, pos);
-      return (left != 0 && right != 0) ? -1 : 0;
-    }
-    if (tok == TOK_OR)
-    {
-      (*pos)++;
-      float right = evalComparison(tokens, pos);
-      return (left != 0 || right != 0) ? -1 : 0;
-    }
+    if (tok == TOK_LESS && tok2 == TOK_EQUAL)       { op = CMP_LE; consumed = 2; }
+    else if (tok == TOK_LESS && tok2 == TOK_GREATER){ op = CMP_NE; consumed = 2; }
+    else if (tok == TOK_GREATER && tok2 == TOK_EQUAL){op = CMP_GE; consumed = 2; }
+    else if (tok == TOK_EQUAL)                      { op = CMP_EQ; consumed = 1; }
+    else if (tok == TOK_LESS)                       { op = CMP_LT; consumed = 1; }
+    else if (tok == TOK_GREATER)                    { op = CMP_GT; consumed = 1; }
 
+    if (op == CMP_NONE) return left;
+
+    *pos += consumed;
+    float right = evalAddSub(tokens, pos);
+    switch (op)
+    {
+      case CMP_EQ: return (left == right) ? -1 : 0;
+      case CMP_NE: return (left != right) ? -1 : 0;
+      case CMP_LT: return (left <  right) ? -1 : 0;
+      case CMP_GT: return (left >  right) ? -1 : 0;
+      case CMP_LE: return (left <= right) ? -1 : 0;
+      case CMP_GE: return (left >= right) ? -1 : 0;
+      default: break;
+    }
     return left;
   }
 
@@ -292,7 +399,17 @@ private:
       {
         (*pos)++;
         float divisor = evalPower(tokens, pos);
-        val = (divisor != 0) ? val / divisor : 0;
+        if (divisor == 0)
+        {
+          // TI XB: divide-by-zero is a warning. Substitute ±MAX so the
+          // program can keep running if ON WARNING != STOP.
+          setWarning("WARNING: NUMBER TOO BIG");
+          val = (val < 0) ? -1.4e38f : 1.4e38f;
+        }
+        else
+        {
+          val /= divisor;
+        }
       }
       else
       {
@@ -392,6 +509,49 @@ private:
         return (float)random(0, 32767) / 32767.0f;
       }
 
+      // DEF FN user-defined function? Name must start with "FN".
+      if (isFunctionCall && peekLen >= 2 &&
+          (fname[0] == 'F' || fname[0] == 'f') &&
+          (fname[1] == 'N' || fname[1] == 'n'))
+      {
+        FnDef* fn = m_vars->findFn(fname, peekLen);
+        if (fn != NULL)
+        {
+          *pos += peekLen;
+          if (tokens[*pos] == TOK_LPAREN) (*pos)++;
+
+          // Evaluate argument and bind to parameter variable. TI semantics
+          // leak the parameter into the caller's scope — we match that.
+          if (fn->isStringParam)
+          {
+            char argBuf[MAX_STR_LEN];
+            evalString(tokens, pos, argBuf, sizeof(argBuf));
+            m_vars->setStr(fn->param, fn->paramLen, argBuf);
+          }
+          else
+          {
+            float arg = evalNumeric(tokens, pos);
+            m_vars->setNum(fn->param, fn->paramLen, arg);
+          }
+          if (tokens[*pos] == TOK_RPAREN) (*pos)++;
+
+          // Evaluate the saved body as a complete expression.
+          int bodyPos = 0;
+          float result;
+          if (fn->isStringFn)
+          {
+            // Numeric factor context — evaluate as numeric (callers using
+            // FN$ in string ctx use a separate path, not implemented yet)
+            result = 0;   // TODO: string-returning FNs in numeric context
+          }
+          else
+          {
+            result = evalNumeric(fn->body, &bodyPos);
+          }
+          return result;
+        }
+      }
+
       if (isFunctionCall)
       {
         // Numeric functions taking a numeric argument
@@ -426,6 +586,17 @@ private:
           if (strcasecmp(fname, "EXP") == 0) return exp(arg);
           if (strcasecmp(fname, "RND") == 0)
             return (float)random(0, 32767) / 32767.0f;
+        }
+
+        // EOF(n) or EOF(#n) — end-of-file test for an open unit
+        if (strcasecmp(fname, "EOF") == 0)
+        {
+          *pos += peekLen;
+          if (tokens[*pos] == TOK_LPAREN) (*pos)++;
+          if (tokens[*pos] == TOK_HASH) (*pos)++;
+          int unit = (int)evalComparison(tokens, pos);
+          if (tokens[*pos] == TOK_RPAREN) (*pos)++;
+          return (m_fileEof && m_fileEof(unit)) ? -1.0f : 0.0f;
         }
 
         // MAX(a,b), MIN(a,b) — two arguments

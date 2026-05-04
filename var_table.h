@@ -14,6 +14,38 @@
 #include <stdlib.h>
 #include <ctype.h>
 
+// DEF FN single-line user-defined function. Body is a slice of the
+// original tokenized program line, so we don't need a full re-parse at
+// call time — just bind the parameter and call evalNumeric/evalString
+// on the stored tokens.
+struct FnDef
+{
+  char    name[16];
+  uint8_t nameLen;
+  char    param[16];
+  uint8_t paramLen;
+  bool    isStringFn;      // FNX$ returns a string
+  bool    isStringParam;   // parameter is a string (like Y$)
+  uint8_t body[128];
+  uint8_t bodyLen;
+};
+
+// Extended-BASIC user-defined subprogram: SUB name(params) .. SUBEND.
+// At RUN init, ExecManager scans the program for SUB declarations and
+// records the name, the line index of the declaration itself, the line
+// index of the matching SUBEND, and the parameter-list token slice
+// (between the LPAREN and RPAREN of the declaration). CALL dispatch
+// uses those bytes to know the parameter names.
+struct SubDef
+{
+  char    name[16];
+  uint8_t nameLen;
+  uint16_t declLineIdx;    // index in program table of the SUB line
+  uint16_t endLineIdx;     // index of the matching SUBEND
+  uint8_t paramTokens[32]; // tokens between LPAREN and RPAREN
+  uint8_t paramTokensLen;
+};
+
 class VarTable
 {
 public:
@@ -39,7 +71,104 @@ public:
     }
     m_varCount = 0;
     m_strCount = 0;
+    m_fnCount = 0;           // DEFs cleared on NEW / RUN
   }
+
+  // --- DEF FN storage ---
+
+  static const int MAX_FNS = 16;
+
+  // Define (or redefine) a function by name.
+  // Returns false if the DEF table is full.
+  bool defineFn(const char* name, int nameLen, bool isStringFn,
+                const char* param, int paramLen, bool isStringParam,
+                const uint8_t* body, int bodyLen)
+  {
+    if (nameLen > 15 || paramLen > 15) return false;
+    if (bodyLen > (int)sizeof(m_fns[0].body)) return false;
+    int slot = findFnSlot(name, nameLen);
+    if (slot < 0)
+    {
+      if (m_fnCount >= MAX_FNS) return false;
+      slot = m_fnCount++;
+    }
+    FnDef& d = m_fns[slot];
+    memcpy(d.name, name, nameLen);
+    d.nameLen = (uint8_t)nameLen;
+    memcpy(d.param, param, paramLen);
+    d.paramLen = (uint8_t)paramLen;
+    d.isStringFn = isStringFn;
+    d.isStringParam = isStringParam;
+    memcpy(d.body, body, bodyLen);
+    d.bodyLen = (uint8_t)bodyLen;
+    return true;
+  }
+
+  FnDef* findFn(const char* name, int nameLen)
+  {
+    int slot = findFnSlot(name, nameLen);
+    return (slot >= 0) ? &m_fns[slot] : NULL;
+  }
+
+  // --- SUB subprogram storage ---
+
+  static const int MAX_SUBS = 16;
+
+  void clearSubs() { m_subCount = 0; }
+
+  bool defineSub(const char* name, int nameLen,
+                 int declLineIdx, int endLineIdx,
+                 const uint8_t* paramTokens, int paramTokensLen)
+  {
+    if (nameLen > 15) return false;
+    if (paramTokensLen > (int)sizeof(m_subs[0].paramTokens)) return false;
+    if (m_subCount >= MAX_SUBS) return false;
+    SubDef& s = m_subs[m_subCount++];
+    memcpy(s.name, name, nameLen);
+    s.nameLen = (uint8_t)nameLen;
+    s.declLineIdx = (uint16_t)declLineIdx;
+    s.endLineIdx  = (uint16_t)endLineIdx;
+    memcpy(s.paramTokens, paramTokens, paramTokensLen);
+    s.paramTokensLen = (uint8_t)paramTokensLen;
+    return true;
+  }
+
+  SubDef* findSub(const char* name, int nameLen)
+  {
+    for (int i = 0; i < m_subCount; i++)
+    {
+      if (m_subs[i].nameLen == nameLen &&
+          memcmp(m_subs[i].name, name, nameLen) == 0)
+      {
+        return &m_subs[i];
+      }
+    }
+    return NULL;
+  }
+
+  int subCount() const { return m_subCount; }
+  SubDef* subAt(int i) { return (i >= 0 && i < m_subCount) ? &m_subs[i] : NULL; }
+
+private:
+  int findFnSlot(const char* name, int nameLen)
+  {
+    for (int i = 0; i < m_fnCount; i++)
+    {
+      if (m_fns[i].nameLen == nameLen &&
+          memcmp(m_fns[i].name, name, nameLen) == 0)
+      {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  FnDef m_fns[MAX_FNS];
+  int   m_fnCount = 0;
+  SubDef m_subs[MAX_SUBS];
+  int    m_subCount = 0;
+
+public:
 
   // --- Scalar access ---
 

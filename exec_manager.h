@@ -39,6 +39,10 @@ public:
   void setGetLine(GetLineFn fn) { m_getLine = fn; }
   void setProgramEnded(ProgramEndedFn fn) { m_programEnded = fn; }
   void setPrepareInput(PrepareInputFn fn) { m_prepareInput = fn; }
+  // Optional per-iteration tick — called after every line so things
+  // like the sprite layer can integrate motion while RUN is busy.
+  typedef void (*PerLineTickFn)();
+  void setPerLineTick(PerLineTickFn fn) { m_perLineTick = fn; }
   TokenParser* tp() { return &m_tp; }
 
   // --- Tracing (TRACE / UNTRACE) ---
@@ -176,6 +180,7 @@ public:
       m_program[i] = NULL;
     }
     m_programSize = 0;
+    m_canContinue = false;
   }
 
   // --- Program execution ---
@@ -188,7 +193,7 @@ public:
     switch (resp.result)
     {
       case TP_NEED_INPUT:
-        if (m_prepareInput)
+        if (m_prepareInput && !resp.cursorPrePositioned)
         {
           m_prepareInput();
         }
@@ -328,11 +333,25 @@ public:
     // Install self-reference for data callbacks
     s_instance = this;
     m_tp.setDataCallbacks(cbNextData, cbResetData);
-    resetData(0);  // Start data pointer at beginning
 
-    m_tp.reset();
+    int lineIdx;
+    if (m_continueNext)
+    {
+      // CONTINUE: resume from saved state; DON'T reset vars, subs, DATA
+      lineIdx = m_resumeLineIdx;
+      m_continueNext = false;
+    }
+    else
+    {
+      // Fresh RUN: full reset
+      resetData(0);
+      m_tp.reset();
+      scanForSubs();
+      m_subDepth = 0;
+      lineIdx = 0;
+    }
+    m_canContinue = false;
     m_running = true;
-    int lineIdx = 0;
 
     // Drain any leftover characters in the serial buffer
     while (Serial.available())
@@ -344,6 +363,27 @@ public:
     {
       ProgramLine* line = m_program[lineIdx];
 
+      // SUB block skip: in main flow (depth 0), a SUB declaration means
+      // skip the whole subprogram body. Subs only run when CALLed. The
+      // corresponding SUBEND is located in the sub table built at run start.
+      if (m_subDepth == 0 && line->length > 0 &&
+          line->tokens[0] == TOK_SUB)
+      {
+        // Find the matching end index from the sub table
+        int skipTo = m_programSize;
+        for (int s = 0; s < m_tp.vars()->subCount(); s++)
+        {
+          SubDef* sd = m_tp.vars()->subAt(s);
+          if (sd && sd->declLineIdx == lineIdx)
+          {
+            skipTo = sd->endLineIdx + 1;
+            break;
+          }
+        }
+        lineIdx = skipTo;
+        continue;
+      }
+
       // TRACE: print the line number before executing it
       if (m_trace && m_printString)
       {
@@ -352,8 +392,14 @@ public:
         m_printString(buf);
       }
 
-      // BREAKPOINT: stop before executing a line that's in the list
-      if (hasBreakpoint(line->lineNum))
+      // BREAKPOINT: stop before executing a line that's in the list.
+      // Right after CONTINUE we skip the check once so we don't re-pause
+      // on the same line that halted us.
+      if (m_skipBreakOnce)
+      {
+        m_skipBreakOnce = false;
+      }
+      else if (hasBreakpoint(line->lineNum))
       {
         if (m_printLine)
         {
@@ -364,6 +410,8 @@ public:
           m_printLine("");
           Serial.write(0x07);
         }
+        m_resumeLineIdx = lineIdx;   // re-run the breakpointed line on CON
+        m_canContinue = true;
         m_running = false;
         break;
       }
@@ -404,17 +452,44 @@ public:
       }
       if (doBreak)
       {
-        if (m_printLine)
+        // ON BREAK NEXT: swallow the break and keep executing
+        if (m_tp.onBreakMode() == OB_NEXT)
         {
-          m_printLine("");
-          char buf[40];
-          snprintf(buf, sizeof(buf), "* BREAKPOINT AT %d",
-                   line->lineNum);
-          m_printLine(buf);
+          // fall through without halting
         }
-        m_running = false;
+        else
+        {
+          if (m_printLine)
+          {
+            m_printLine("");
+            char buf[40];
+            snprintf(buf, sizeof(buf), "* BREAKPOINT AT %d",
+                     line->lineNum);
+            m_printLine(buf);
+          }
+          if (lineIdx >= 0)
+          {
+            m_resumeLineIdx = lineIdx;
+            m_canContinue = true;
+          }
+          m_running = false;
+        }
       }
 
+      if (m_perLineTick) m_perLineTick();
+      if (m_throttleUs > 0)
+      {
+        // Bigger throttles use delay() (yields to BLE / watchdog);
+        // smaller use delayMicroseconds() for finer-grained pacing.
+        if (m_throttleUs >= 1000)
+        {
+          delay(m_throttleUs / 1000);
+        }
+        else
+        {
+          delayMicroseconds(m_throttleUs);
+        }
+      }
       yield();  // Prevent watchdog timeout
     }
 
@@ -443,6 +518,134 @@ private:
   int  m_breakpoints[MAX_BREAKPOINTS];
   int  m_breakpointCount;
 
+public:
+  // Per-line throttle (microseconds). 0 = unthrottled (default), our
+  // native ESP32 speed which is ~30x a real TI. Settable via
+  // CALL SPEED(n). Useful values:
+  //   285  ≈ TI Extended BASIC native speed
+  //   666  ≈ stock TI BASIC native speed
+  //   1000 = 1000 statements/sec — generic "slow"
+  unsigned long m_throttleUs = 0;
+private:
+
+  // CONTINUE state. m_canContinue is set when STOP, breakpoint, or user
+  // BREAK halts the program. m_continueNext tells run() to resume from
+  // m_resumeLineIdx without resetting vars/subs/DATA. m_skipBreakOnce
+  // suppresses the breakpoint check for the first iteration after
+  // CONTINUE so we don't immediately re-pause on the line that already
+  // halted us.
+  bool m_canContinue = false;
+  bool m_continueNext = false;
+  bool m_skipBreakOnce = false;
+  int  m_resumeLineIdx = 0;
+
+public:
+  void cont()
+  {
+    if (!m_canContinue)
+    {
+      if (m_printError) m_printError("* CAN'T CONTINUE");
+      return;
+    }
+    m_continueNext = true;
+    m_skipBreakOnce = true;
+    run();
+  }
+
+  void clearContinueState() { m_canContinue = false; }
+private:
+
+  // CALL sub(...) return stack. Each entry is the line index to resume
+  // at when SUBEND/SUBEXIT pops, plus pass-by-value-result aliases for
+  // bare-variable arguments. Depth > 0 means we're currently inside a
+  // subprogram; main flow is depth 0.
+  struct SubFrame
+  {
+    int        returnLineIdx;
+    TPSubAlias aliases[6];
+    uint8_t    aliasCount;
+  };
+  static const int MAX_SUB_DEPTH = 8;
+  SubFrame m_subStack[MAX_SUB_DEPTH];
+  int m_subDepth = 0;
+
+public:
+  void pushSubCall(int returnLineIdx)
+  {
+    if (m_subDepth < MAX_SUB_DEPTH)
+    {
+      m_subStack[m_subDepth].returnLineIdx = returnLineIdx;
+      m_subStack[m_subDepth].aliasCount = 0;
+      m_subDepth++;
+    }
+  }
+  int popSubCall()
+  {
+    if (m_subDepth == 0) return -1;
+    return m_subStack[--m_subDepth].returnLineIdx;
+  }
+  int subDepth() const { return m_subDepth; }
+
+  // Scan the program for SUB declarations, build the sub table.
+  // Called once per RUN.
+  void scanForSubs()
+  {
+    m_tp.vars()->clearSubs();
+    for (int i = 0; i < m_programSize; i++)
+    {
+      ProgramLine* pl = m_program[i];
+      int pos = 0;
+      if (pos >= pl->length) continue;
+      if (pl->tokens[pos] != TOK_SUB) continue;
+
+      // Parse the SUB declaration: SUB name(param-list)
+      pos++;   // past TOK_SUB
+      if (!isIdentStart(pl->tokens[pos])) continue;
+
+      char sname[16];
+      int nameLen = 0;
+      while (pos < pl->length &&
+             isIdentCont(pl->tokens[pos]) &&
+             nameLen < 15)
+      {
+        sname[nameLen++] = (char)pl->tokens[pos++];
+      }
+
+      // Capture param-list tokens (between LPAREN and RPAREN). SUB with
+      // no parens is allowed — leaves paramTokensLen = 0.
+      uint8_t params[32];
+      int paramLen = 0;
+      if (pos < pl->length && pl->tokens[pos] == TOK_LPAREN)
+      {
+        pos++;
+        while (pos < pl->length &&
+               pl->tokens[pos] != TOK_RPAREN &&
+               pl->tokens[pos] != TOK_EOL &&
+               paramLen < (int)sizeof(params))
+        {
+          params[paramLen++] = pl->tokens[pos++];
+        }
+      }
+
+      // Scan forward for matching SUBEND.
+      int endIdx = -1;
+      for (int j = i + 1; j < m_programSize; j++)
+      {
+        if (m_program[j]->length > 0 &&
+            m_program[j]->tokens[0] == TOK_SUBEND)
+        {
+          endIdx = j;
+          break;
+        }
+      }
+      if (endIdx < 0) endIdx = m_programSize;   // unterminated = EOF
+
+      m_tp.vars()->defineSub(sname, nameLen, i, endIdx, params, paramLen);
+    }
+  }
+
+private:
+
   TokenParser m_tp;
   PrintLineFn m_printLine;
   PrintErrorFn m_printError;
@@ -450,6 +653,7 @@ private:
   GetLineFn m_getLine;
   ProgramEndedFn m_programEnded = NULL;
   PrepareInputFn m_prepareInput = NULL;
+  PerLineTickFn  m_perLineTick  = NULL;
 
   // DATA reading state
   int m_dataLineIdx = 0;
@@ -467,6 +671,56 @@ private:
 
       case TP_NEXT_LINE:
         return currentIdx + 1;
+
+      case TP_CALL_SUB:
+      {
+        // Push return address (line after the CALL) and jump to the
+        // first line of the sub body (one past the SUB declaration).
+        if (m_subDepth >= MAX_SUB_DEPTH)
+        {
+          if (m_printError) m_printError("* STACK OVERFLOW");
+          m_running = false;
+          return -1;
+        }
+        SubFrame& f = m_subStack[m_subDepth++];
+        f.returnLineIdx = currentIdx + 1;
+        f.aliasCount = resp.aliasCount;
+        for (uint8_t i = 0; i < resp.aliasCount; i++)
+        {
+          f.aliases[i] = resp.aliases[i];
+        }
+        return resp.lineIdx + 1;
+      }
+
+      case TP_SUB_RETURN:
+      {
+        if (m_subDepth == 0)
+        {
+          if (m_printError) m_printError("* MUST BE IN SUBPROGRAM");
+          m_running = false;
+          return -1;
+        }
+        SubFrame& f = m_subStack[m_subDepth - 1];
+        // Pass-by-value-result: copy each param's final value back to
+        // the caller's variable.
+        VarTable* vars = m_tp.vars();
+        for (uint8_t i = 0; i < f.aliasCount; i++)
+        {
+          const TPSubAlias& a = f.aliases[i];
+          if (a.isStr)
+          {
+            const char* s = vars->getStr(a.paramName, a.paramLen);
+            vars->setStr(a.callerName, a.callerLen, s ? s : "");
+          }
+          else
+          {
+            float v = vars->getNum(a.paramName, a.paramLen);
+            vars->setNum(a.callerName, a.callerLen, v);
+          }
+        }
+        m_subDepth--;
+        return f.returnLineIdx;
+      }
 
       case TP_GOTO_LINE:
       {
@@ -504,31 +758,51 @@ private:
 
       case TP_NEXT_LOOP:
       {
-        // Find the FOR line and re-feed it to the TP
         int forIdx = findLineIndex(resp.lineNum);
-        if (forIdx < m_programSize &&
-            m_program[forIdx]->lineNum == resp.lineNum)
+        if (forIdx >= m_programSize ||
+            m_program[forIdx]->lineNum != resp.lineNum)
         {
-          ProgramLine* forLine = m_program[forIdx];
-          TPResponse loopResp = m_tp.processLine(
-            forLine->tokens, forLine->length,
-            forLine->lineNum, true);
-
-          if (loopResp.result == TP_END_LOOP)
-          {
-            // Find the NEXT line and continue after it
-            // The NEXT is at currentIdx, so continue from currentIdx + 1
-            return currentIdx + 1;
-          }
-          else
-          {
-            // Loop continues — go to the line after the FOR
-            return forIdx + 1;
-          }
+          if (m_printError) m_printError("* FOR-NEXT NESTING");
+          m_running = false;
+          return -1;
         }
-        if (m_printError) m_printError("* FOR-NEXT NESTING");
-        m_running = false;
-        return -1;
+        ProgramLine* forLine = m_program[forIdx];
+
+        // Single-line FOR/NEXT (FOR and NEXT on same line). Each
+        // re-feed runs ONE iteration; we keep re-feeding until the
+        // loop ends so the body runs the right number of times.
+        if (forIdx == currentIdx)
+        {
+          while (true)
+          {
+            TPResponse loopResp = m_tp.processLine(
+              forLine->tokens, forLine->length,
+              forLine->lineNum, true);
+            if (loopResp.result == TP_END_LOOP) break;
+            if (loopResp.result == TP_ERROR)
+            {
+              return handleResponse(loopResp, currentIdx);
+            }
+            // Same per-iteration housekeeping the outer loop does
+            if (m_perLineTick) m_perLineTick();
+            if (m_throttleUs > 0)
+            {
+              if (m_throttleUs >= 1000) delay(m_throttleUs / 1000);
+              else                      delayMicroseconds(m_throttleUs);
+            }
+            yield();
+          }
+          return currentIdx + 1;
+        }
+
+        // Multi-line FOR/NEXT: re-feed once (FOR's increment + check),
+        // and if continuing, jump to the body (forIdx + 1) and let the
+        // outer loop drive successive iterations.
+        TPResponse loopResp = m_tp.processLine(
+          forLine->tokens, forLine->length,
+          forLine->lineNum, true);
+        if (loopResp.result == TP_END_LOOP) return currentIdx + 1;
+        return forIdx + 1;
       }
 
       case TP_END_LOOP:
@@ -537,8 +811,9 @@ private:
 
       case TP_NEED_INPUT:
       {
-        // Move cursor to bottom of screen (TI behavior)
-        if (m_prepareInput)
+        // Move cursor to bottom of screen (TI behavior) — UNLESS the
+        // statement already positioned it (ACCEPT AT).
+        if (m_prepareInput && !resp.cursorPrePositioned)
         {
           m_prepareInput();
         }
@@ -563,19 +838,82 @@ private:
         m_running = false;
         return -1;
 
+      case TP_STOPPED:
+        // STOP: allow CONTINUE to resume at the line after STOP.
+        m_resumeLineIdx = currentIdx + 1;
+        m_canContinue = true;
+        m_running = false;
+        if (m_printLine)
+        {
+          char buf[32];
+          m_printLine("");
+          snprintf(buf, sizeof(buf), "* STOPPED AT %d",
+                   m_program[currentIdx]->lineNum);
+          m_printLine(buf);
+        }
+        return -1;
+
+      case TP_WARNING:
+      {
+        OnWarningMode wm = m_tp.onWarningMode();
+        if (wm == OW_NEXT)
+        {
+          return currentIdx + 1;   // silent — value already substituted
+        }
+        if (wm == OW_PRINT)
+        {
+          if (m_printLine)
+          {
+            char buf[80];
+            snprintf(buf, sizeof(buf), "* %s IN %d",
+                     resp.errorMsg, m_program[currentIdx]->lineNum);
+            m_printLine(buf);
+          }
+          return currentIdx + 1;
+        }
+        // OW_STOP: promote to error — fall through to TP_ERROR path.
+        TPResponse upgraded = resp;
+        upgraded.result = TP_ERROR;
+        return handleResponse(upgraded, currentIdx);
+      }
+
       case TP_ERROR:
+      {
+        uint16_t errLine = m_program[currentIdx]->lineNum;
+        m_tp.setLastErrorLine(errLine);
+        OnErrorMode em = m_tp.onErrorMode();
+
+        if (em == OE_GOTO)
+        {
+          uint16_t target = m_tp.onErrorLine();
+          int idx = findLineIndex(target);
+          if (idx < m_programSize && m_program[idx]->lineNum == target)
+          {
+            // Reset handler so a re-error inside the handler doesn't
+            // loop forever. Handler can re-arm ON ERROR if desired.
+            m_tp.disarmOnError();
+            return idx;
+          }
+          // Handler line missing — fall through to default STOP path
+        }
+        if (em == OE_NEXT)
+        {
+          return currentIdx + 1;
+        }
+
         if (m_printLine)
         {
           char buf[80];
           m_printLine("");
           snprintf(buf, sizeof(buf), "* %s IN %d",
-                   resp.errorMsg, m_program[currentIdx]->lineNum);
+                   resp.errorMsg, errLine);
           m_printLine(buf);
           m_printLine("");
           Serial.write(0x07);   // BEL
         }
         m_running = false;
         return -1;
+      }
 
       default:
         return currentIdx + 1;

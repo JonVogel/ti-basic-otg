@@ -12,6 +12,7 @@
 #pragma once
 
 #include <BleHidHost.h>
+#include "ble_gamepad.h"
 
 // ---------------------------------------------------------------------------
 // Ring buffer
@@ -113,7 +114,7 @@ static int bleKbHidToAscii(uint8_t k, bool shift)
   {
     case HID_KEY_ENTER:     return '\r';
     case HID_KEY_ESCAPE:    return 0x1B;
-    case HID_KEY_BACKSPACE: return 0x08;
+    case HID_KEY_BACKSPACE: return 0x7F;
     case HID_KEY_TAB:       return '\t';
     case HID_KEY_SPACE:     return ' ';
     case 0x2D: return shift ? '_'  : '-';
@@ -154,8 +155,12 @@ static int bleKbHidToAscii(uint8_t k, bool shift)
 // Edge-triggered HID report handler (runs in BLE notify context)
 static void bleKbOnReport(const uint8_t* report, size_t len)
 {
-  if (len < 8)
+  // Anything that isn't a standard 8-byte HID keyboard report goes to
+  // the gamepad parser. Both the 8BitDo Zero 2's gamepad modes and
+  // generic BLE gamepads send variable-length reports here.
+  if (len != 8)
   {
+    bleGpOnReport(report, len);
     return;
   }
   static uint8_t prevKeys[6] = {0};
@@ -163,6 +168,26 @@ static void bleKbOnReport(const uint8_t* report, size_t len)
   uint8_t modifiers = report[0];
   const uint8_t* keys = &report[2];
   bool shift = (modifiers & (HID_MOD_LSHIFT | HID_MOD_RSHIFT)) != 0;
+
+  // Mirror arrow-key press state into the joystick globals so CALL
+  // JOYST works in keyboard mode (Zero 2 mode K) and from any
+  // ordinary BLE keyboard.
+  bool up = false, down = false, left = false, right = false;
+  for (int i = 0; i < 6; i++)
+  {
+    switch (keys[i])
+    {
+      case HID_KEY_UP:    up    = true; break;
+      case HID_KEY_DOWN:  down  = true; break;
+      case HID_KEY_LEFT:  left  = true; break;
+      case HID_KEY_RIGHT: right = true; break;
+    }
+  }
+  joyArrowUp    = up;
+  joyArrowDown  = down;
+  joyArrowLeft  = left;
+  joyArrowRight = right;
+  bleGpUpdateFromArrows();
 
   // F12 edge → trigger pairing
   bool f12Now = false, f12Prev = false;
@@ -233,4 +258,25 @@ static inline void bleKbInit()
 static inline void bleKbTask()
 {
   BleHidHost::task();
+
+  // Keyboards that drop into deep sleep re-advertise only briefly when
+  // a key is pressed; if our scanner isn't active at that exact
+  // moment, we miss the window and stay disconnected forever (until
+  // the user reboots or hits F12). Watchdog this: any time we're
+  // disconnected and not already in pairing mode for >5 s, kick off a
+  // pairing/scan window. Permissive pairing is fine for a toy.
+  static uint32_t disconnectAt = 0;
+  if (BleHidHost::isConnected() || BleHidHost::inPairingMode())
+  {
+    disconnectAt = 0;
+  }
+  else if (disconnectAt == 0)
+  {
+    disconnectAt = millis();
+  }
+  else if (millis() - disconnectAt > 5000)
+  {
+    BleHidHost::requestPairingMode();
+    disconnectAt = 0;
+  }
 }

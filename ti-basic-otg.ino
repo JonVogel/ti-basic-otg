@@ -21,9 +21,12 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
 #include <LittleFS.h>
+#include <SD.h>
 #include "ti_font.h"
 #include "ble_keyboard.h"
 #include "exec_manager.h"
+#include "file_io.h"
+#include "sprites.h"
 #include "line_editor.h"
 
 // LCD pins
@@ -80,6 +83,7 @@ static const KeywordEntry keywords[] =
   {"NUMBER",     TOK_NUM},
   {"NUM",        TOK_NUM},
   {"PRINT",      TOK_PRINT},
+  {"USING",      TOK_USING},
   {"DISPLAY",    TOK_DISPLAY},
   {"ACCEPT",     TOK_ACCEPT},
   {"GOTO",       TOK_GOTO},
@@ -110,6 +114,8 @@ static const KeywordEntry keywords[] =
   {"BASE",       TOK_BASE},
   {"BREAK",      TOK_BREAK},
   {"UNBREAK",    TOK_UNBREAK},
+  {"ERROR",      TOK_ERROR},
+  {"WARNING",    TOK_WARNING},
   {"CONTINUE",   TOK_CONTINUE},
   {"CON",        TOK_CONTINUE},
   {"RESEQUENCE", TOK_RES},
@@ -122,12 +128,23 @@ static const KeywordEntry keywords[] =
   {"SUBEXIT",    TOK_SUBEXIT},
   {"OPEN",       TOK_OPEN},
   {"CLOSE",      TOK_CLOSE},
+  {"OUTPUT",     TOK_OUTPUT},
+  {"UPDATE",     TOK_UPDATE},
+  {"APPEND",     TOK_APPEND},
+  {"SEQUENTIAL", TOK_SEQUENTIAL},
+  {"RELATIVE",   TOK_RELATIVE},
+  {"INTERNAL",   TOK_INTERNAL},
+  {"FIXED",      TOK_FIXED},
+  {"PERMANENT",  TOK_PERMANENT},
+  {"VARIABLE",   TOK_VARIABLE_KW},
+  {"REC",        TOK_REC},
   {"DELETE",     TOK_DELETE},
   {"IMAGE",      TOK_IMAGE},
   {"TRACE",      TOK_TRACE},
   {"UNTRACE",    TOK_UNTRACE},
   {"AND",        TOK_AND},
   {"OR",         TOK_OR},
+  {"XOR",        TOK_XOR},
   {"NOT",        TOK_NOT},
   {NULL, TOK_EOL}
 };
@@ -272,33 +289,19 @@ static int tokenizeLine(const char* src, uint8_t* tokens, int maxLen)
       case ':':  tokens[out++] = TOK_COLON;      pos++; break;
       case '=':  tokens[out++] = TOK_EQUAL;      pos++; break;
       case '<':
-        if (src[pos + 1] == '=')
-        {
-          tokens[out++] = TOK_LESS_EQ;
-          pos += 2;
-        }
-        else if (src[pos + 1] == '>')
-        {
-          tokens[out++] = TOK_NOT_EQUAL;
-          pos += 2;
-        }
-        else
-        {
-          tokens[out++] = TOK_LESS;
-          pos++;
-        }
+        // TI encodes compound comparisons as two separate tokens:
+        // <=  →  TOK_LESS + TOK_EQUAL
+        // <>  →  TOK_LESS + TOK_GREATER
+        // >=  →  TOK_GREATER + TOK_EQUAL
+        tokens[out++] = TOK_LESS;
+        if (src[pos + 1] == '=')      { tokens[out++] = TOK_EQUAL;   pos += 2; }
+        else if (src[pos + 1] == '>') { tokens[out++] = TOK_GREATER; pos += 2; }
+        else                          {                              pos++;    }
         break;
       case '>':
-        if (src[pos + 1] == '=')
-        {
-          tokens[out++] = TOK_GREATER_EQ;
-          pos += 2;
-        }
-        else
-        {
-          tokens[out++] = TOK_GREATER;
-          pos++;
-        }
+        tokens[out++] = TOK_GREATER;
+        if (src[pos + 1] == '=') { tokens[out++] = TOK_EQUAL; pos += 2; }
+        else                     {                            pos++;    }
         break;
       default:
         foundOp = false;
@@ -427,9 +430,9 @@ static int detokenizeLine(const uint8_t* tokens, int length, char* buf,
       case TOK_EQUAL:      appendStr(buf, out, bufSize, "="); continue;
       case TOK_LESS:       appendStr(buf, out, bufSize, "<"); continue;
       case TOK_GREATER:    appendStr(buf, out, bufSize, ">"); continue;
-      case TOK_NOT_EQUAL:  appendStr(buf, out, bufSize, "<>"); continue;
-      case TOK_LESS_EQ:    appendStr(buf, out, bufSize, "<="); continue;
-      case TOK_GREATER_EQ: appendStr(buf, out, bufSize, ">="); continue;
+      // Compound comparisons (<=, <>, >=) are stored as two-token
+      // sequences and reconstructed in the keyword loop below; we
+      // don't need single-token cases for them here.
       case TOK_CONCAT:     appendStr(buf, out, bufSize, "&"); continue;
       case TOK_AND:        appendStr(buf, out, bufSize, " AND "); continue;
       case TOK_OR:         appendStr(buf, out, bufSize, " OR "); continue;
@@ -1665,12 +1668,16 @@ static void cmdNew()
   showStatus("NEW program");
 }
 
-static void cmdList()
+// LIST [n[-m]] / LIST n- / LIST -m / LIST  (full)
+// startLine == 0 → from beginning, endLine == -1 → to end.
+static void cmdList(int startLine, int endLine)
 {
   char buf[256];
   for (int i = 0; i < em.programSize(); i++)
   {
     ProgramLine* line = em.getLine(i);
+    if (startLine > 0 && line->lineNum < startLine) continue;
+    if (endLine   > 0 && line->lineNum > endLine)   break;
     int n = snprintf(buf, sizeof(buf), "%d ", line->lineNum);
     detokenizeLine(line->tokens, line->length, &buf[n], sizeof(buf) - n);
     printLine(buf);
@@ -1936,6 +1943,86 @@ static void cmdResequence(int startLine, int increment)
   }
 }
 
+// --- File I/O shims (wired into TokenParser via setFileCallbacks) ---
+//
+// The file_io.h layer routes OPEN/CLOSE/PRINT#/INPUT#/EOF() to either
+// LittleFS (FLASH./SDCARD.) or a mounted V9T9 disk image (DSKn.).
+// Display-agnostic — same shims work on both the RGB-panel and OTG
+// builds.
+static int shimFileOpen(int unit, const char* spec, int mode,
+                        int flags, int recLen)
+{
+  return fio::openFile(unit, spec, (fio::Mode)mode, flags, recLen);
+}
+static int shimFileClose(int unit) { return fio::closeFile(unit); }
+static int shimFilePrint(int unit, const char* text)
+{
+  return fio::printLineTo(unit, text);
+}
+static int shimFileReadLine(int unit, char* buf, int bufSize)
+{
+  return fio::readLineFrom(unit, buf, bufSize);
+}
+static bool shimFileEof(int unit) { return fio::isEof(unit); }
+static bool shimFileSeekRec(int unit, long rec)
+{
+  return fio::seekRecord(unit, rec);
+}
+static bool shimFileRewind(int unit)
+{
+  return fio::rewindFile(unit);
+}
+
+// --- Sprite stub callbacks ---
+//
+// The OTG dev board's small ST7789 LCD doesn't render sprites yet
+// (TODO: implement a per-pixel sprite layer for this display). For
+// now these are no-ops so CALL SPRITE / CALL MOTION / CALL POSITION
+// etc. parse and update the sprite state without drawing anything.
+// CALL POSITION still returns coherent snapshot values.
+static void spriteStubDraw(int slot)  { (void)slot; }
+static void spriteStubErase(int slot) { (void)slot; }
+
+// --- CALL JOYST callback ---
+static void readJoystick(int unit, int* outX, int* outY)
+{
+  *outX = bleGpJoystickX(unit);
+  *outY = bleGpJoystickY(unit);
+}
+
+// --- cmdContinue / cmdDelete stubs to round out the command set ---
+static void cmdContinue() { em.cont(); }
+
+static void cmdDelete(const char* filename)
+{
+  if (!filename || !filename[0])
+  {
+    printError("* BAD FILE NAME");
+    return;
+  }
+  // FLASH-only delete for the OTG variant. The full main-build
+  // version handles SDCARD. and DSKn. prefixes too.
+  char path[48];
+  if (filename[0] == '/')
+  {
+    snprintf(path, sizeof(path), "%s", filename);
+  }
+  else
+  {
+    snprintf(path, sizeof(path), "/%s.bas", filename);
+  }
+  if (LittleFS.remove(path))
+  {
+    char msg[64];
+    snprintf(msg, sizeof(msg), "DELETED: %s", path);
+    printLine(msg);
+  }
+  else
+  {
+    printError("* FILE ERROR");
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Command processor (handles typed input)
 // ---------------------------------------------------------------------------
@@ -2097,6 +2184,20 @@ void setup()
   em.tp()->setCmdRes(cmdResequence);
   em.tp()->setCmdNum(cmdNumber);
   em.tp()->setCmdMerge(cmdMerge);
+  em.tp()->setCmdDelete(cmdDelete);
+  em.tp()->setCmdContinue(cmdContinue);
+  em.tp()->setFileCallbacks(shimFileOpen, shimFileClose, shimFilePrint,
+                            shimFileReadLine, shimFileEof);
+  em.tp()->setFileSeekRec(shimFileSeekRec);
+  em.tp()->setFileRewind(shimFileRewind);
+  em.tp()->setReadJoystick(readJoystick);
+  // Sprite stubs — no rendering on the OTG ST7789 yet, but the
+  // language layer needs the callbacks to dispatch CALL SPRITE etc.
+  em.tp()->setSpriteCallbacks(spriteStubDraw, spriteStubErase);
+  em.tp()->setThrottleCallback([](unsigned long us) {
+    em.m_throttleUs = us;
+    em.tp()->setThrottleUs(us);
+  });
   em.setProgramEnded(gfxReset);
   em.setPrepareInput(gfxPrepareInput);
   em.setPrintLine(printLine);

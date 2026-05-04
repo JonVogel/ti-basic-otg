@@ -51,7 +51,7 @@ goto compile_upload
 :compile
 echo.
 echo === Compiling ===
-arduino-cli compile --fqbn !FQBN! --libraries "!SKETCH_DIR!\.." "!SKETCH_DIR!"
+arduino-cli compile --fqbn !FQBN! --libraries "!SKETCH_DIR!" "!SKETCH_DIR!"
 goto end
 
 :upload
@@ -63,7 +63,7 @@ goto end
 :compile_upload
 echo.
 echo === Compiling ===
-arduino-cli compile --fqbn !FQBN! --libraries "!SKETCH_DIR!\.." "!SKETCH_DIR!"
+arduino-cli compile --fqbn !FQBN! --libraries "!SKETCH_DIR!" "!SKETCH_DIR!"
 if errorlevel 1 goto end
 echo.
 echo === Uploading to !PORT! ===
@@ -79,7 +79,7 @@ goto end
 :all
 echo.
 echo === Compiling ===
-arduino-cli compile --fqbn !FQBN! --libraries "!SKETCH_DIR!\.." "!SKETCH_DIR!"
+arduino-cli compile --fqbn !FQBN! --libraries "!SKETCH_DIR!" "!SKETCH_DIR!"
 if errorlevel 1 goto end
 echo.
 echo === Uploading to !PORT! ===

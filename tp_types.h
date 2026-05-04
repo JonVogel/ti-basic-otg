@@ -35,15 +35,40 @@ enum TPResult : uint8_t
   TP_END_LOOP,
   TP_NEED_INPUT,
   TP_FINISHED,
-  TP_ERROR
+  TP_STOPPED,       // STOP — like FINISHED but CONTINUE can resume
+  TP_ERROR,
+  TP_WARNING,       // Recoverable diagnostic — EM honors ON WARNING mode
+  TP_CALL_SUB,      // Push return addr, jump to lineNum (subprogram entry)
+  TP_SUB_RETURN     // Pop return addr and jump (SUBEND / SUBEXIT)
+};
+
+// Modes for ON BREAK / ON ERROR / ON WARNING handler configuration.
+enum OnBreakMode   : uint8_t { OB_STOP = 0, OB_NEXT = 1 };
+enum OnErrorMode   : uint8_t { OE_STOP = 0, OE_NEXT = 1, OE_GOTO = 2 };
+enum OnWarningMode : uint8_t { OW_PRINT = 0, OW_STOP = 1, OW_NEXT = 2 };
+
+// For CALL sub(args): when an arg is a bare variable reference, we record
+// an alias so the sub's modifications to that parameter are copied back
+// into the caller's variable on SUBEND/SUBEXIT (pass-by-value-result).
+struct TPSubAlias
+{
+  char    paramName[12];
+  uint8_t paramLen;
+  char    callerName[12];
+  uint8_t callerLen;
+  bool    isStr;
 };
 
 struct TPResponse
 {
   TPResult result;
-  uint16_t lineNum;
+  uint16_t lineNum;         // target line NUMBER for GOTO/GOSUB/…
+  uint16_t lineIdx = 0;     // target line INDEX for TP_CALL_SUB
   char errorMsg[40];
   char prompt[80];
+  bool cursorPrePositioned = false;   // ACCEPT AT: EM should NOT move cursor
+  TPSubAlias aliases[6];              // only used with TP_CALL_SUB
+  uint8_t aliasCount = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -143,15 +168,9 @@ enum Token : uint8_t
   TOK_LINENUM      = 0xC9,   // line number — followed by 2 binary bytes
   TOK_EOF_MARK     = 0xCA,
 
-  // --- Internal interim tokens (will be phased out for TI compatibility) ---
-  // Phase 4 will remove the variable tokens (stored as raw ASCII instead).
+  // --- Source-code aliases ---
   TOK_STRING_LIT   = TOK_QUOTED_STR,       // alias for 0xC7
-  TOK_NUMBER_LIT   = TOK_UNQUOTED_STR,     // alias for 0xC8 (ASCII digits now)
-  TOK_VARIABLE     = 0xAB,   // numeric variable (to be replaced with raw ASCII)
-  TOK_VAR_STRING   = 0xAC,   // string variable (to be replaced with raw ASCII)
-  TOK_NOT_EQUAL    = 0xAD,   // <> (TI uses two tokens)
-  TOK_LESS_EQ      = 0xAE,   // <= (TI uses two tokens)
-  TOK_GREATER_EQ   = 0xAF,   // >= (TI uses two tokens)
+  TOK_NUMBER_LIT   = TOK_UNQUOTED_STR,     // alias for 0xC8 (ASCII digits)
 
   // --- Numeric functions (0xCB-0xDC) ---
   TOK_ABS        = 0xCB,
@@ -209,6 +228,12 @@ enum Token : uint8_t
 
 #define MAX_LINES       1000
 #define MAX_LINE_TOKENS 256
+
+// TI-99/4A standard screen dimensions (used by CALL HCHAR/VCHAR/GCHAR
+// bounds and wrap logic). Matches the real TI grid regardless of the
+// physical display's char count in the main sketch.
+#define TI_COLS         32
+#define TI_ROWS         24
 #define MAX_INPUT_LEN   140
 
 struct ProgramLine

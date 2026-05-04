@@ -15,6 +15,7 @@
 #include "tp_types.h"
 #include "var_table.h"
 #include "expr_parser.h"
+#include "sprites.h"
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
@@ -33,6 +34,8 @@ typedef void (*SetCharPatternFn)(int charCode, const uint8_t* pattern8);
 typedef void (*GetCharPatternFn)(int charCode, uint8_t* out8);
 typedef void (*ResetCharsetFn)();
 typedef int  (*ReadKeyFn)();           // returns 0 = no key, else char code
+// CALL JOYST(unit, X, Y) — fills X and Y with -4 / 0 / +4 axis state.
+typedef void (*ReadJoystickFn)(int unit, int* outX, int* outY);
 typedef void (*MoveCursorFn)(int row, int col);
 
 // DATA support: EM scans program for next DATA value.
@@ -43,11 +46,43 @@ typedef void (*ResetDataFn)(uint16_t lineNum);
 
 // Command callbacks — provided by the EM for immediate commands
 typedef void (*CmdNewFn)();
-typedef void (*CmdListFn)();
+// LIST range: startLine/endLine of -1 means "unspecified" (open-ended).
+typedef void (*CmdListFn)(int startLine, int endLine);
 typedef void (*CmdRunFn)();
 typedef void (*CmdSaveFn)(const char* filename);
 typedef void (*CmdOldFn)(const char* filename);
 typedef void (*CmdMergeFn)(const char* filename);
+typedef void (*CmdDeleteFn)(const char* filename);
+typedef void (*CmdContinueFn)();
+
+// Sprite rendering — implemented by the sketch (drawCell + pixel layer).
+typedef void (*SpriteDrawFn)(int slot);
+typedef void (*SpriteEraseFn)(int slot);
+
+// CALL SPEED(usPerLine) — sets execution-throttle in EM.
+typedef void (*SetThrottleFn)(unsigned long us);
+
+// PRINT USING <lineN>: looks up an IMAGE statement by line number.
+// Out: pointer + length to the format string. Returns true on hit.
+typedef bool (*ImageLookupFn)(uint16_t lineNum, const char** outStr,
+                              int* outLen);
+
+// File I/O callbacks — thin shims over file_io.h. Return 0 on success,
+// non-zero on error; errorMsgOut optional (may be NULL).
+typedef int (*FileOpenFn)(int unit, const char* spec, int mode,
+                          int flags, int recLen);
+// File flag bits — must mirror fio::OF_* in file_io.h.
+static const int FF_INTERNAL = 0x01;
+static const int FF_FIXED    = 0x02;
+static const int FF_RELATIVE = 0x04;
+// Per-unit RELATIVE record positioning (PRINT #N, REC=K).
+typedef bool (*FileSeekRecFn)(int unit, long rec);
+// RESTORE #N — rewind a file to the first record without closing it.
+typedef bool (*FileRewindFn)(int unit);
+typedef int (*FileCloseFn)(int unit);
+typedef int (*FilePrintFn)(int unit, const char* text);
+typedef int (*FileReadLineFn)(int unit, char* buf, int bufSize);
+typedef bool (*FileEofFn)(int unit);
 typedef void (*CmdByeFn)();
 typedef void (*CmdDirFn)();
 typedef void (*CmdSizeFn)();
@@ -102,6 +137,7 @@ public:
   }
 
   void setReadKey(ReadKeyFn rk) { m_readKey = rk; }
+  void setReadJoystick(ReadJoystickFn fn) { m_readJoystick = fn; }
   void setMoveCursor(MoveCursorFn mc) { m_moveCursor = mc; }
   void setGetCharPattern(GetCharPatternFn fn) { m_getCharPattern = fn; }
   void setResetCharset(ResetCharsetFn fn)     { m_resetCharset   = fn; }
@@ -112,6 +148,30 @@ public:
   void setCmdRes(CmdResFn f)     { m_cmdRes = f; }
   void setCmdNum(CmdNumFn f)     { m_cmdNum = f; }
   void setCmdMerge(CmdMergeFn f) { m_cmdMerge = f; }
+  void setCmdDelete(CmdDeleteFn f) { m_cmdDelete = f; }
+  void setCmdContinue(CmdContinueFn f) { m_cmdContinue = f; }
+
+  void setSpriteCallbacks(SpriteDrawFn d, SpriteEraseFn e)
+  {
+    m_spriteDraw  = d;
+    m_spriteErase = e;
+  }
+
+  void setThrottleCallback(SetThrottleFn f) { m_setThrottle = f; }
+  void setImageLookup(ImageLookupFn f) { m_imageLookup = f; }
+
+  void setFileCallbacks(FileOpenFn o, FileCloseFn c, FilePrintFn p,
+                        FileReadLineFn r, FileEofFn e)
+  {
+    m_fileOpen = o;
+    m_fileClose = c;
+    m_filePrint = p;
+    m_fileReadLine = r;
+    m_fileEof = e;
+    m_expr.setFileEof(e);
+  }
+  void setFileSeekRec(FileSeekRecFn f) { m_fileSeekRec = f; }
+  void setFileRewind(FileRewindFn f)   { m_fileRewind  = f; }
   void setDataCallbacks(NextDataFn nd, ResetDataFn rd)
   {
     m_nextData = nd;
@@ -124,7 +184,22 @@ public:
     m_vars.clear();
     m_forDepth = 0;
     m_gosubDepth = 0;
+    m_onBreakMode   = OB_STOP;
+    m_onErrorMode   = OE_STOP;
+    m_onErrorLine   = 0;
+    m_onWarningMode = OW_PRINT;
+    m_lastErrorLine = 0;
+    m_soundEndTime  = 0;
   }
+
+  // --- ON BREAK / ON ERROR / ON WARNING accessors ---
+  OnBreakMode   onBreakMode()   const { return m_onBreakMode; }
+  OnErrorMode   onErrorMode()   const { return m_onErrorMode; }
+  uint16_t      onErrorLine()   const { return m_onErrorLine; }
+  OnWarningMode onWarningMode() const { return m_onWarningMode; }
+  uint16_t      lastErrorLine() const { return m_lastErrorLine; }
+  void setLastErrorLine(uint16_t ln) { m_lastErrorLine = ln; }
+  void disarmOnError() { m_onErrorMode = OE_STOP; m_onErrorLine = 0; }
 
   // Process a full line of tokens. Returns flow control decision.
   TPResponse processLine(const uint8_t* tokens, int length,
@@ -135,16 +210,36 @@ public:
     resp.lineNum = 0;
     resp.errorMsg[0] = '\0';
 
+    m_expr.clearError();
+
     int pos = 0;
 
     while (pos < length && tokens[pos] != TOK_EOL)
     {
+      // Expression evaluator raised a diagnostic during the previous
+      // statement — promote it to a line-level TP_ERROR / TP_WARNING.
+      if (m_expr.hasDiag())
+      {
+        resp.result = m_expr.hasError() ? TP_ERROR : TP_WARNING;
+        snprintf(resp.errorMsg, sizeof(resp.errorMsg), "%s",
+                 m_expr.errorMsg());
+        m_expr.clearError();
+        return resp;
+      }
+
       uint8_t tok = tokens[pos];
 
-      // Statement separator
+      // Statement separator. `::` tokenizes as two TOK_COLONs in a row;
+      // collapse them so a `::` counts as one separator (and one throttle).
       if (tok == TOK_COLON)
       {
         pos++;
+        while (tokens[pos] == TOK_COLON) pos++;
+        if (m_throttleUs > 0)
+        {
+          if (m_throttleUs >= 1000) delay(m_throttleUs / 1000);
+          else                      delayMicroseconds(m_throttleUs);
+        }
         continue;
       }
 
@@ -256,7 +351,8 @@ public:
         case TOK_LINPUT:
         {
           pos++;
-          resp = execInput(tokens, &pos);  // LINPUT works like INPUT for us
+          m_linputMode = true;
+          resp = execInput(tokens, &pos);
           return resp;
         }
 
@@ -302,10 +398,20 @@ public:
         case TOK_RESTORE:
         {
           pos++;
-          uint16_t lineNum = 0;
-          if (tokens[pos] == TOK_UNQUOTED_STR)
+          // RESTORE #n — rewind file unit n to its first record.
+          if (tokens[pos] == TOK_HASH)
           {
-            lineNum = (uint16_t)readNumber(tokens, &pos);
+            pos++;
+            int unit = (int)m_expr.evalNumeric(tokens, &pos);
+            if (m_fileRewind) m_fileRewind(unit);
+            break;
+          }
+          // RESTORE [<line>] — reset DATA pointer.
+          uint16_t lineNum = 0;
+          if (tokens[pos] == TOK_LINENUM ||
+              tokens[pos] == TOK_UNQUOTED_STR)
+          {
+            lineNum = readLineNum(tokens, &pos);
           }
           if (m_resetData) m_resetData(lineNum);
           break;
@@ -338,6 +444,29 @@ public:
           break;
         }
 
+        case TOK_DEF:
+        {
+          pos++;
+          execDef(tokens, &pos, length);
+          return resp;   // DEF consumes the rest of the line
+        }
+
+        case TOK_SUB:
+          // A SUB declaration at runtime means we're either inside a
+          // call (EM skips directly to body) or we've fallen into one
+          // from main flow (EM handles that skip). Either way nothing
+          // to do here — just finish the line.
+          return resp;
+
+        case TOK_SUBEND:
+        case TOK_SUBEXIT:
+        {
+          TPResponse out;
+          out.result = TP_SUB_RETURN;
+          out.errorMsg[0] = '\0';
+          return out;
+        }
+
         case TOK_OPTION:
         {
           pos++;
@@ -359,8 +488,29 @@ public:
         }
 
         case TOK_LIST:
-          if (m_cmdList) m_cmdList();
+        {
+          pos++;
+          // Parse optional range: [start] [ - [end] ]
+          // Accepts: LIST | LIST n | LIST n- | LIST -m | LIST n-m
+          int startLine = -1;
+          int endLine = -1;
+          if (tokens[pos] == TOK_UNQUOTED_STR)
+          {
+            startLine = (int)readNumber(tokens, &pos);
+            endLine = startLine;   // single line unless '-' follows
+          }
+          if (tokens[pos] == TOK_MINUS)
+          {
+            pos++;
+            endLine = -1;   // open-ended after '-'
+            if (tokens[pos] == TOK_UNQUOTED_STR)
+            {
+              endLine = (int)readNumber(tokens, &pos);
+            }
+          }
+          if (m_cmdList) m_cmdList(startLine, endLine);
           return resp;
+        }
 
         case TOK_BYE:
           if (m_cmdBye) m_cmdBye();
@@ -393,6 +543,19 @@ public:
           return resp;
         }
 
+        case TOK_DELETE:
+        {
+          pos++;
+          char filename[32] = "";
+          extractFilename(tokens, &pos, filename, sizeof(filename));
+          if (m_cmdDelete) m_cmdDelete(filename);
+          return resp;
+        }
+
+        case TOK_CONTINUE:
+          if (m_cmdContinue) m_cmdContinue();
+          return resp;
+
         case TOK_SIZE:
           if (m_cmdSize) m_cmdSize();
           return resp;
@@ -414,9 +577,10 @@ public:
           while (count < 16 && tokens[pos] != TOK_EOL &&
                  tokens[pos] != TOK_COLON)
           {
-            if (tokens[pos] == TOK_UNQUOTED_STR)
+            if (tokens[pos] == TOK_LINENUM ||
+                tokens[pos] == TOK_UNQUOTED_STR)
             {
-              lines[count++] = (int)readNumber(tokens, &pos);
+              lines[count++] = (int)readLineNum(tokens, &pos);
             }
             else
             {
@@ -437,9 +601,10 @@ public:
           while (n < 2 && tokens[pos] != TOK_EOL &&
                  tokens[pos] != TOK_COLON)
           {
-            if (tokens[pos] == TOK_UNQUOTED_STR)
+            if (tokens[pos] == TOK_LINENUM ||
+                tokens[pos] == TOK_UNQUOTED_STR)
             {
-              args[n++] = (int)readNumber(tokens, &pos);
+              args[n++] = (int)readLineNum(tokens, &pos);
             }
             else
             {
@@ -458,20 +623,84 @@ public:
           return resp;
         }
 
+        case TOK_BANG:
         case TOK_REM:
-          // Skip rest of line
+        case TOK_IMAGE:
+          // Skip rest of line. IMAGE stores a format string for
+          // PRINT USING <lineNum>: ... — the format is read by walking
+          // the program for the matching line, not by executing here.
           return resp;  // NEXT_LINE
 
         case TOK_END:
-        case TOK_STOP:
           resp.result = TP_FINISHED;
           return resp;
 
-        default:
-          // Unknown token — skip
+        case TOK_STOP:
+          resp.result = TP_STOPPED;
+          return resp;
+
+        case TOK_ELSE:
+          // Reaching ELSE on the main dispatcher means a successful
+          // THEN branch just finished — the ELSE clause must be
+          // discarded. Without this, `IF c THEN x ELSE y` would run
+          // BOTH x and y when c is true.
+          while (pos < length && tokens[pos] != TOK_EOL)
+          {
+            uint8_t t = tokens[pos];
+            if (t == TOK_QUOTED_STR || t == TOK_UNQUOTED_STR ||
+                t == TOK_STRING_LIT)
+            {
+              pos++;
+              int slen = tokens[pos++];
+              pos += slen;
+            }
+            else
+            {
+              pos++;
+            }
+          }
+          break;
+
+        case TOK_OPEN:
           pos++;
+          resp = execOpen(tokens, &pos);
+          if (resp.result == TP_ERROR) return resp;
+          break;
+
+        case TOK_CLOSE:
+          pos++;
+          resp = execClose(tokens, &pos);
+          if (resp.result == TP_ERROR) return resp;
+          break;
+
+        default:
+          // Unknown token — skip past it. String/number literals carry
+          // a length byte + N content bytes; a bare `pos++` would walk
+          // those bytes back into the dispatcher and re-interpret them
+          // as opcodes (e.g. a 7-char string body's length byte = 0x07
+          // = TOK_SAVE → spurious SAVE invocation).
+          if (tok == TOK_QUOTED_STR || tok == TOK_UNQUOTED_STR ||
+              tok == TOK_STRING_LIT)
+          {
+            pos++;                    // past the type tag
+            int slen = tokens[pos++]; // past the length byte
+            pos += slen;              // past the content
+          }
+          else
+          {
+            pos++;
+          }
           break;
       }
+    }
+
+    // Catch diagnostics raised by the final statement on the line.
+    if (m_expr.hasDiag())
+    {
+      resp.result = m_expr.hasError() ? TP_ERROR : TP_WARNING;
+      snprintf(resp.errorMsg, sizeof(resp.errorMsg), "%s",
+               m_expr.errorMsg());
+      m_expr.clearError();
     }
 
     return resp;  // NEXT_LINE
@@ -495,11 +724,34 @@ private:
   // Pending INPUT state
   const uint8_t* m_inputTokens = NULL;
   int m_inputVarStart = 0;
+  bool m_linputMode = false;   // LINPUT: whole line to first var, no comma split
 
   GosubFrame m_gosubStack[MAX_GOSUB_DEPTH];
   int m_gosubDepth = 0;
 
   int m_optionBase = 0;  // OPTION BASE 0 or 1 (affects DIM)
+
+  // ON BREAK / ON ERROR / ON WARNING handler state
+  OnBreakMode   m_onBreakMode   = OB_STOP;
+  OnErrorMode   m_onErrorMode   = OE_STOP;
+  uint16_t      m_onErrorLine   = 0;
+  OnWarningMode m_onWarningMode = OW_PRINT;
+  uint16_t      m_lastErrorLine = 0;   // for CALL ERR
+
+  // CALL SOUND schedule — millis() past which the current (stub) sound
+  // is finished. Positive-duration CALL SOUND waits for this before
+  // scheduling the new one.
+  unsigned long m_soundEndTime = 0;
+
+  // Per-statement throttle in microseconds, set via CALL SPEED.
+  // Applied at every statement separator (`::` / `:`) and once at the
+  // end of each line, so multi-statement lines feel like a TI's pace.
+  unsigned long m_throttleUs = 0;
+
+public:
+  void setThrottleUs(unsigned long us) { m_throttleUs = us; }
+  unsigned long throttleUs() const { return m_throttleUs; }
+private:
 
   PrintCharFn m_printChar;
   PrintStringFn m_printString;
@@ -518,6 +770,21 @@ private:
   CmdResFn m_cmdRes = NULL;
   CmdNumFn m_cmdNum = NULL;
   CmdMergeFn m_cmdMerge = NULL;
+  CmdDeleteFn m_cmdDelete = NULL;
+  CmdContinueFn m_cmdContinue = NULL;
+
+  SpriteDrawFn  m_spriteDraw  = NULL;
+  SpriteEraseFn m_spriteErase = NULL;
+  SetThrottleFn m_setThrottle = NULL;
+  ImageLookupFn m_imageLookup = NULL;
+
+  FileOpenFn     m_fileOpen     = NULL;
+  FileCloseFn    m_fileClose    = NULL;
+  FilePrintFn    m_filePrint    = NULL;
+  FileReadLineFn m_fileReadLine = NULL;
+  FileEofFn      m_fileEof      = NULL;
+  FileSeekRecFn  m_fileSeekRec  = NULL;
+  FileRewindFn   m_fileRewind   = NULL;
 
   SetCharFn m_setChar = NULL;
   GetCharFn m_getChar = NULL;
@@ -527,6 +794,7 @@ private:
   GetCharPatternFn m_getCharPattern = NULL;
   ResetCharsetFn   m_resetCharset   = NULL;
   ReadKeyFn m_readKey = NULL;
+  ReadJoystickFn m_readJoystick = NULL;
   MoveCursorFn m_moveCursor = NULL;
   NextDataFn m_nextData = NULL;
   ResetDataFn m_resetData = NULL;
@@ -566,13 +834,286 @@ private:
     return false;
   }
 
+  // --- PRINT USING / IMAGE format engine ---
+  //
+  // Walks an IMAGE format string, substituting numeric edit fields
+  // ('#' digit slots, optional '.' decimal point, optional leading
+  // '-' sign space, '^^^^' scientific notation) with values from
+  // the supplied list. Anything else in the IMAGE passes through
+  // literally.
+  //
+  // Returns number of bytes written to `out`.
+  int formatUsing(const char* image, int imageLen,
+                  const uint8_t* tokens, int* pos,
+                  char* out, int outSize)
+  {
+    int op = 0;
+    int ip = 0;
+    while (ip < imageLen)
+    {
+      char ch = image[ip];
+
+      // Detect an edit field — a run of '#', '.', '-', '+', '^'
+      if (ch == '#' || ch == '.' || ch == '-' ||
+          ch == '+' || ch == '^')
+      {
+        int fieldStart = ip;
+        while (ip < imageLen)
+        {
+          char fc = image[ip];
+          if (fc != '#' && fc != '.' && fc != '-' &&
+              fc != '+' && fc != '^') break;
+          ip++;
+        }
+        const char* field = &image[fieldStart];
+        int fieldLen = ip - fieldStart;
+
+        // Read next value from token stream
+        if (tokens[*pos] == TOK_COMMA || tokens[*pos] == TOK_SEMICOLON)
+        {
+          (*pos)++;
+        }
+        float val = m_expr.evalNumeric(tokens, pos);
+
+        // Count digit slots
+        int intSlots = 0, fracSlots = 0;
+        bool sawDot = false;
+        bool hasSign = false;
+        bool hasExp  = false;
+        int  expCarets = 0;
+        for (int i = 0; i < fieldLen; i++)
+        {
+          char fc = field[i];
+          if (fc == '#')      { if (sawDot) fracSlots++; else intSlots++; }
+          else if (fc == '.') { sawDot = true; }
+          else if (fc == '-' || fc == '+') { hasSign = true; }
+          else if (fc == '^') { hasExp = true; expCarets++; }
+        }
+        if (!hasExp) expCarets = 0;
+
+        // Format the value
+        bool negative = (val < 0);
+        float absVal = negative ? -val : val;
+        char numbuf[32];
+
+        if (hasExp && expCarets >= 2)
+        {
+          // Scientific notation: e.g. "##.##^^^^" → 1.23E+04
+          int decimals = fracSlots;
+          int sigDigits = intSlots + fracSlots;
+          if (sigDigits < 1) sigDigits = 1;
+          // Use printf %e style, then trim mantissa digits
+          char tmp[32];
+          snprintf(tmp, sizeof(tmp), "%.*e", decimals, absVal);
+          snprintf(numbuf, sizeof(numbuf), "%s%s",
+                   negative ? "-" : (hasSign ? " " : ""), tmp);
+        }
+        else
+        {
+          // Fixed-point
+          char tmp[32];
+          if (sawDot)
+          {
+            snprintf(tmp, sizeof(tmp), "%.*f", fracSlots, absVal);
+          }
+          else
+          {
+            snprintf(tmp, sizeof(tmp), "%.0f", absVal);
+          }
+          int tmpLen = strlen(tmp);
+          int needed = tmpLen + (negative ? 1 : (hasSign ? 1 : 0));
+          int width  = intSlots + (sawDot ? 1 : 0) + fracSlots;
+
+          // Find length of integer part of tmp (before any '.')
+          int tmpIntLen = 0;
+          for (int i = 0; i < tmpLen; i++)
+          {
+            if (tmp[i] == '.') break;
+            tmpIntLen++;
+          }
+          int intNeeded = tmpIntLen + (negative || hasSign ? 1 : 0);
+
+          if (intNeeded > intSlots)
+          {
+            // Overflow — TI prints '#'s in every slot
+            for (int i = 0; i < width; i++) numbuf[i] = '#';
+            numbuf[width] = '\0';
+          }
+          else
+          {
+            int p = 0;
+            int padCount = intSlots - intNeeded;
+            for (int i = 0; i < padCount; i++) numbuf[p++] = ' ';
+            if (negative)        numbuf[p++] = '-';
+            else if (hasSign)    numbuf[p++] = ' ';
+            memcpy(&numbuf[p], tmp, tmpLen);
+            p += tmpLen;
+            numbuf[p] = '\0';
+          }
+        }
+
+        int nbLen = strlen(numbuf);
+        for (int i = 0; i < nbLen && op < outSize - 1; i++)
+        {
+          out[op++] = numbuf[i];
+        }
+      }
+      else
+      {
+        // Literal character
+        if (op < outSize - 1) out[op++] = ch;
+        ip++;
+      }
+    }
+    out[op] = '\0';
+    return op;
+  }
+
   // --- Statement handlers ---
+
+  // Build a formatted output line the same way PRINT does (`;`, `,`,
+  // expressions) but into a buffer, then send it to file unit. Each
+  // PRINT # statement writes exactly one line.
+  void execPrintFile(const uint8_t* tokens, int* pos, int unit)
+  {
+    char out[MAX_STR_LEN];
+    int olen = 0;
+    int col = 0;
+
+    while (tokens[*pos] != TOK_EOL && tokens[*pos] != TOK_COLON &&
+           tokens[*pos] != TOK_BANG)
+    {
+      uint8_t tok = tokens[*pos];
+      if (tok == TOK_SEMICOLON) { (*pos)++; continue; }
+      if (tok == TOK_COMMA)
+      {
+        (*pos)++;
+        int nextTab = ((col / 14) + 1) * 14;
+        while (col < nextTab && olen < (int)sizeof(out) - 1)
+        {
+          out[olen++] = ' ';
+          col++;
+        }
+        continue;
+      }
+      if (tok == TOK_QUOTED_STR || isStringExprStart(tokens, *pos))
+      {
+        char strBuf[MAX_STR_LEN];
+        m_expr.evalString(tokens, pos, strBuf, sizeof(strBuf));
+        int sl = strlen(strBuf);
+        if (olen + sl < (int)sizeof(out) - 1)
+        {
+          memcpy(&out[olen], strBuf, sl);
+          olen += sl;
+          col  += sl;
+        }
+      }
+      else if (tok == TOK_UNQUOTED_STR || isIdentStart(tok) ||
+               tok == TOK_LPAREN || tok == TOK_MINUS || tok == TOK_NOT)
+      {
+        float val = m_expr.evalNumeric(tokens, pos);
+        char buf[20];
+        if (val >= 0) snprintf(buf, sizeof(buf), " %g ", val);
+        else          snprintf(buf, sizeof(buf),  "%g ", val);
+        int sl = strlen(buf);
+        if (olen + sl < (int)sizeof(out) - 1)
+        {
+          memcpy(&out[olen], buf, sl);
+          olen += sl;
+          col  += sl;
+        }
+      }
+      else
+      {
+        (*pos)++;
+      }
+    }
+    out[olen] = '\0';
+
+    if (m_filePrint)
+    {
+      m_filePrint(unit, out);
+    }
+  }
 
   void execPrint(const uint8_t* tokens, int* pos, bool addNewline = true)
   {
+    // PRINT #n [, REC k] : ... — file output. Build one line's worth of
+    // text into a buffer and hand it to the file I/O layer.
+    if (tokens[*pos] == TOK_HASH)
+    {
+      (*pos)++;
+      int unit = (int)m_expr.evalNumeric(tokens, pos);
+      if (tokens[*pos] == TOK_COMMA && tokens[*pos + 1] == TOK_REC)
+      {
+        (*pos)++;   // comma
+        (*pos)++;   // REC
+        if (tokens[*pos] == TOK_EQUAL) (*pos)++;
+        long rec = (long)m_expr.evalNumeric(tokens, pos);
+        if (m_fileSeekRec) m_fileSeekRec(unit, rec);
+      }
+      if (tokens[*pos] == TOK_COLON) (*pos)++;
+      execPrintFile(tokens, pos, unit);
+      return;
+    }
+
+    // PRINT USING <imageRef>: list...   — TI-style formatted output.
+    // imageRef is either a line-number-pointing-at-IMAGE or a string
+    // literal/expression containing the format directly.
+    if (tokens[*pos] == TOK_USING)
+    {
+      (*pos)++;
+      char imageBuf[160];
+      int  imageLen = 0;
+      // Variant 1: line number reference
+      if (tokens[*pos] == TOK_LINENUM ||
+          tokens[*pos] == TOK_UNQUOTED_STR)
+      {
+        uint16_t ln = readLineNum(tokens, pos);
+        if (m_imageLookup)
+        {
+          const char* p; int n;
+          if (m_imageLookup(ln, &p, &n))
+          {
+            int copy = (n < (int)sizeof(imageBuf) - 1) ? n :
+                       (int)sizeof(imageBuf) - 1;
+            memcpy(imageBuf, p, copy);
+            imageLen = copy;
+          }
+        }
+      }
+      else
+      {
+        // Variant 2: string expression
+        m_expr.evalString(tokens, pos, imageBuf, sizeof(imageBuf));
+        imageLen = strlen(imageBuf);
+      }
+      // Consume separator before the value list
+      if (tokens[*pos] == TOK_COLON || tokens[*pos] == TOK_SEMICOLON)
+      {
+        (*pos)++;
+      }
+      // Trim leading whitespace from imageBuf since IMAGE captures the
+      // literal source text after the keyword (which usually has a
+      // single leading space).
+      int trim = 0;
+      while (trim < imageLen && imageBuf[trim] == ' ') trim++;
+
+      char outBuf[200];
+      int outLen = formatUsing(&imageBuf[trim], imageLen - trim,
+                               tokens, pos, outBuf, sizeof(outBuf));
+      if (m_printString) m_printString(outBuf);
+      m_printCol += outLen;
+      // PRINT USING ends with newline unless caller suppresses
+      if (addNewline && m_printChar) m_printChar('\n');
+      m_printCol = 0;
+      return;
+    }
+
     bool needNewline = true;
 
-    while (tokens[*pos] != TOK_EOL && tokens[*pos] != TOK_COLON)
+    while (tokens[*pos] != TOK_EOL && tokens[*pos] != TOK_COLON &&
+           tokens[*pos] != TOK_BANG)
     {
       uint8_t tok = tokens[*pos];
 
@@ -630,7 +1171,8 @@ private:
         needNewline = true;
       }
       else if (tok == TOK_UNQUOTED_STR || isIdentStart(tok) ||
-               tok == TOK_LPAREN || tok == TOK_MINUS)
+               tok == TOK_LPAREN || tok == TOK_MINUS ||
+               tok == TOK_NOT)
       {
         float val = m_expr.evalNumeric(tokens, pos);
         char buf[20];
@@ -672,6 +1214,47 @@ private:
   // String expression evaluation moved to ExprParser (m_expr.evalString)
 
   // Returns true on success, false on syntax error (no '=' after identifier).
+  // DEF FNname(param) = expression
+  //
+  // Parses the signature and body and stores the function in the variable
+  // table. The body is saved as a slice of the original token stream —
+  // on call, ExprParser binds the parameter to its variable and evaluates
+  // the saved body via evalNumeric / evalString.
+  void execDef(const uint8_t* tokens, int* pos, int length)
+  {
+    if (!isIdentStart(tokens[*pos])) return;
+    char fname[16];
+    bool fnIsStr;
+    int fnLen = parseIdent(tokens, pos, fname, sizeof(fname), &fnIsStr);
+
+    if (tokens[*pos] != TOK_LPAREN) return;
+    (*pos)++;
+
+    if (!isIdentStart(tokens[*pos])) return;
+    char pname[16];
+    bool pIsStr;
+    int pLen = parseIdent(tokens, pos, pname, sizeof(pname), &pIsStr);
+
+    if (tokens[*pos] != TOK_RPAREN) return;
+    (*pos)++;
+
+    if (tokens[*pos] != TOK_EQUAL) return;
+    (*pos)++;
+
+    // Capture tokens from here to end of statement / line
+    int bodyStart = *pos;
+    while (*pos < length && tokens[*pos] != TOK_EOL &&
+           tokens[*pos] != TOK_COLON)
+    {
+      (*pos)++;
+    }
+    int bodyLen = *pos - bodyStart;
+
+    m_vars.defineFn(fname, fnLen, fnIsStr,
+                    pname, pLen, pIsStr,
+                    &tokens[bodyStart], bodyLen);
+  }
+
   bool execAssignment(const uint8_t* tokens, int* pos)
   {
     char vname[MAX_VAR_NAME];
@@ -734,7 +1317,8 @@ private:
   // READ var1,var2,... — pull values from DATA statements
   void execRead(const uint8_t* tokens, int* pos)
   {
-    while (tokens[*pos] != TOK_EOL && tokens[*pos] != TOK_COLON)
+    while (tokens[*pos] != TOK_EOL && tokens[*pos] != TOK_COLON &&
+           tokens[*pos] != TOK_BANG)
     {
       if (!isIdentStart(tokens[*pos]))
       {
@@ -826,6 +1410,8 @@ private:
   // ACCEPT [AT(row,col)[:]] var
   TPResponse execAccept(const uint8_t* tokens, int* pos)
   {
+    bool hadAt = false;
+
     // Check for AT(row, col)
     if (isIdentStart(tokens[*pos]))
     {
@@ -841,6 +1427,7 @@ private:
         if (tokens[*pos] == TOK_RPAREN) (*pos)++;
 
         if (m_moveCursor) m_moveCursor(row - 1, col - 1);
+        hadAt = true;
 
         if (tokens[*pos] == TOK_COLON || tokens[*pos] == TOK_SEMICOLON)
         {
@@ -853,11 +1440,13 @@ private:
     TPResponse resp;
     resp.result = TP_NEED_INPUT;
     resp.errorMsg[0] = '\0';
-    resp.prompt[0] = '\0';    // no prompt for ACCEPT
+    resp.prompt[0] = '\0';          // no prompt for ACCEPT
+    resp.cursorPrePositioned = hadAt;
 
     m_inputTokens = tokens;
     m_inputVarStart = *pos;
-    while (tokens[*pos] != TOK_EOL && tokens[*pos] != TOK_COLON)
+    while (tokens[*pos] != TOK_EOL && tokens[*pos] != TOK_COLON &&
+           tokens[*pos] != TOK_BANG)
     {
       (*pos)++;
     }
@@ -870,6 +1459,40 @@ private:
     TPResponse resp;
     resp.result = TP_NEXT_LINE;
     resp.errorMsg[0] = '\0';
+
+    // ON BREAK STOP | NEXT
+    if (tokens[*pos] == TOK_BREAK)
+    {
+      (*pos)++;
+      if (tokens[*pos] == TOK_STOP)      { m_onBreakMode = OB_STOP; (*pos)++; }
+      else if (tokens[*pos] == TOK_NEXT) { m_onBreakMode = OB_NEXT; (*pos)++; }
+      return resp;
+    }
+
+    // ON ERROR <line> | STOP | NEXT
+    if (tokens[*pos] == TOK_ERROR)
+    {
+      (*pos)++;
+      if (tokens[*pos] == TOK_STOP)      { m_onErrorMode = OE_STOP; (*pos)++; }
+      else if (tokens[*pos] == TOK_NEXT) { m_onErrorMode = OE_NEXT; (*pos)++; }
+      else if (tokens[*pos] == TOK_LINENUM ||
+               tokens[*pos] == TOK_UNQUOTED_STR)
+      {
+        m_onErrorLine = readLineNum(tokens, pos);
+        m_onErrorMode = OE_GOTO;
+      }
+      return resp;
+    }
+
+    // ON WARNING STOP | PRINT | NEXT
+    if (tokens[*pos] == TOK_WARNING)
+    {
+      (*pos)++;
+      if (tokens[*pos] == TOK_STOP)       { m_onWarningMode = OW_STOP;  (*pos)++; }
+      else if (tokens[*pos] == TOK_PRINT) { m_onWarningMode = OW_PRINT; (*pos)++; }
+      else if (tokens[*pos] == TOK_NEXT)  { m_onWarningMode = OW_NEXT;  (*pos)++; }
+      return resp;
+    }
 
     int index = (int)m_expr.evalNumeric(tokens, pos);
 
@@ -885,15 +1508,17 @@ private:
     uint16_t targetLine = 0;
     bool found = false;
 
-    while (tokens[*pos] != TOK_EOL && tokens[*pos] != TOK_COLON)
+    while (tokens[*pos] != TOK_EOL && tokens[*pos] != TOK_COLON &&
+           tokens[*pos] != TOK_BANG)
     {
       count++;
-      if (tokens[*pos] == TOK_UNQUOTED_STR)
+      if (tokens[*pos] == TOK_LINENUM ||
+          tokens[*pos] == TOK_UNQUOTED_STR)
       {
-        float val = readNumber(tokens, pos);
+        uint16_t val = readLineNum(tokens, pos);
         if (count == index)
         {
-          targetLine = (uint16_t)val;
+          targetLine = val;
           found = true;
           // Don't break — consume remaining tokens to stay aligned
         }
@@ -931,7 +1556,8 @@ private:
   // DIM A(10) or DIM A(5,10) or DIM A(3,5,2), and string versions
   void execDim(const uint8_t* tokens, int* pos)
   {
-    while (tokens[*pos] != TOK_EOL && tokens[*pos] != TOK_COLON)
+    while (tokens[*pos] != TOK_EOL && tokens[*pos] != TOK_COLON &&
+           tokens[*pos] != TOK_BANG)
     {
       if (!isIdentStart(tokens[*pos]))
       {
@@ -967,6 +1593,25 @@ private:
     }
   }
 
+  // Read a line-number reference — TI-style TOK_LINENUM (0xC9 + 2 bytes)
+  // preferred, but falls back to TOK_UNQUOTED_STR for backwards compat
+  // and for tokenized output that somehow skipped the line-ref flag.
+  uint16_t readLineNum(const uint8_t* tokens, int* pos)
+  {
+    if (tokens[*pos] == TOK_LINENUM)
+    {
+      (*pos)++;
+      uint16_t ln = ((uint16_t)tokens[*pos] << 8) | tokens[*pos + 1];
+      *pos += 2;
+      return ln;
+    }
+    if (tokens[*pos] == TOK_UNQUOTED_STR)
+    {
+      return (uint16_t)readNumber(tokens, pos);
+    }
+    return 0;
+  }
+
   // Read a number from token stream (TOK_UNQUOTED_STR + length + ASCII)
   // Advances pos past the number. Returns 0 if not a number token.
   float readNumber(const uint8_t* tokens, int* pos)
@@ -986,16 +1631,120 @@ private:
     return strtof(buf, NULL);
   }
 
+  // OPEN #n:"DEVICE.NAME"[,mode-keywords...]
+  // Modes recognized: INPUT, OUTPUT, UPDATE, APPEND, SEQUENTIAL, DISPLAY,
+  //                   VARIABLE <n>, INTERNAL, RELATIVE, FIXED, PERMANENT.
+  // Only SEQUENTIAL + DISPLAY + INPUT/OUTPUT/APPEND/UPDATE are actually
+  // supported; INTERNAL / RELATIVE / FIXED accept and ignore.
+  TPResponse execOpen(const uint8_t* tokens, int* pos)
+  {
+    TPResponse resp;
+    resp.result = TP_NEXT_TOKEN;
+    resp.errorMsg[0] = '\0';
+
+    if (tokens[*pos] == TOK_HASH) (*pos)++;
+    int unit = (int)m_expr.evalNumeric(tokens, pos);
+    if (tokens[*pos] == TOK_COLON) (*pos)++;
+
+    char spec[64] = "";
+    m_expr.evalString(tokens, pos, spec, sizeof(spec));
+
+    int mode = 0;   // TI default = INPUT
+    int flags = 0;
+    int recLen = 0;
+    while (tokens[*pos] == TOK_COMMA)
+    {
+      (*pos)++;
+      uint8_t k = tokens[*pos];
+      if (k == TOK_INPUT)    { mode = 0; (*pos)++; }
+      else if (k == TOK_OUTPUT)  { mode = 1; (*pos)++; }
+      else if (k == TOK_APPEND)  { mode = 2; (*pos)++; }
+      else if (k == TOK_UPDATE)  { mode = 3; (*pos)++; }
+      else if (k == TOK_INTERNAL) { flags |= FF_INTERNAL; (*pos)++; }
+      else if (k == TOK_RELATIVE) { flags |= FF_RELATIVE; (*pos)++;
+                                    // Optional max-record-count (ignored)
+                                    if (tokens[*pos] == TOK_UNQUOTED_STR)
+                                    {
+                                      readNumber(tokens, pos);
+                                    }
+                                  }
+      else if (k == TOK_FIXED)
+      {
+        flags |= FF_FIXED;
+        (*pos)++;
+        // FIXED is normally followed by a record length (default 80)
+        if (tokens[*pos] == TOK_UNQUOTED_STR)
+        {
+          recLen = (int)readNumber(tokens, pos);
+        }
+        else
+        {
+          recLen = 80;
+        }
+      }
+      else if (k == TOK_VARIABLE_KW)
+      {
+        (*pos)++;
+        if (tokens[*pos] == TOK_UNQUOTED_STR) readNumber(tokens, pos);
+      }
+      else if (k == TOK_SEQUENTIAL || k == TOK_PERMANENT ||
+               k == TOK_DISPLAY)
+      {
+        (*pos)++;
+      }
+      else
+      {
+        (*pos)++;
+      }
+    }
+
+    // FIXED implies a default record length if user omitted one.
+    if ((flags & FF_FIXED) && recLen == 0) recLen = 80;
+
+    if (!m_fileOpen)
+    {
+      resp.result = TP_ERROR;
+      snprintf(resp.errorMsg, sizeof(resp.errorMsg), "I/O ERROR");
+      return resp;
+    }
+    int err = m_fileOpen(unit, spec, mode, flags, recLen);
+    if (err != 0)
+    {
+      resp.result = TP_ERROR;
+      snprintf(resp.errorMsg, sizeof(resp.errorMsg), "FILE ERROR");
+      return resp;
+    }
+    return resp;
+  }
+
+  // CLOSE #n [, #m ...]
+  TPResponse execClose(const uint8_t* tokens, int* pos)
+  {
+    TPResponse resp;
+    resp.result = TP_NEXT_TOKEN;
+    resp.errorMsg[0] = '\0';
+
+    while (tokens[*pos] == TOK_HASH || tokens[*pos] == TOK_UNQUOTED_STR ||
+           tokens[*pos] == TOK_COMMA)
+    {
+      if (tokens[*pos] == TOK_COMMA) { (*pos)++; continue; }
+      if (tokens[*pos] == TOK_HASH)  { (*pos)++; }
+      int unit = (int)m_expr.evalNumeric(tokens, pos);
+      if (m_fileClose) m_fileClose(unit);
+    }
+    return resp;
+  }
+
   TPResponse execGoto(const uint8_t* tokens, int* pos)
   {
     TPResponse resp;
     resp.errorMsg[0] = '\0';
 
-    if (tokens[*pos] == TOK_UNQUOTED_STR)
+    if (tokens[*pos] == TOK_LINENUM ||
+        tokens[*pos] == TOK_UNQUOTED_STR)
     {
-      float val = readNumber(tokens, pos);
       resp.result = TP_GOTO_LINE;
-      resp.lineNum = (uint16_t)val;
+      resp.lineNum = readLineNum(tokens, pos);
     }
     else
     {
@@ -1017,13 +1766,12 @@ private:
       return resp;
     }
 
-    if (tokens[*pos] == TOK_UNQUOTED_STR)
+    if (tokens[*pos] == TOK_LINENUM ||
+        tokens[*pos] == TOK_UNQUOTED_STR)
     {
-      float val = readNumber(tokens, pos);
-
       m_gosubStack[m_gosubDepth++].returnLineNum = currentLine;
       resp.result = TP_GOTO_LINE;
-      resp.lineNum = (uint16_t)val;
+      resp.lineNum = readLineNum(tokens, pos);
     }
     else
     {
@@ -1066,8 +1814,10 @@ private:
 
     if (cond)
     {
-      // Check if THEN is followed by a line number (GOTO shorthand)
-      if (tokens[*pos] == TOK_NUMBER_LIT)
+      // Check if THEN is followed by a line number (GOTO shorthand).
+      // Accept both TI-style TOK_LINENUM and legacy TOK_UNQUOTED_STR.
+      if (tokens[*pos] == TOK_LINENUM ||
+          tokens[*pos] == TOK_UNQUOTED_STR)
       {
         return execGoto(tokens, pos);
       }
@@ -1085,7 +1835,8 @@ private:
         {
           (*pos)++;
           // Check if ELSE is followed by a line number
-          if (tokens[*pos] == TOK_NUMBER_LIT)
+          if (tokens[*pos] == TOK_LINENUM ||
+              tokens[*pos] == TOK_UNQUOTED_STR)
           {
             return execGoto(tokens, pos);
           }
@@ -1120,32 +1871,13 @@ private:
     // Check if this variable is already on the FOR stack
     int stackIdx = findForVar(vname, vlen);
 
-    if (stackIdx >= 0)
-    {
-      // Iteration — increment and check limit
-      ForFrame* f = &m_forStack[stackIdx];
-      Variable* v = m_vars.findNum(vname, vlen);
-      if (v)
-      {
-        v->numVal += f->step;
-
-        bool done = (f->step > 0) ? (v->numVal > f->limit)
-                                  : (v->numVal < f->limit);
-        if (done)
-        {
-          // Remove this frame and all above it
-          m_forDepth = stackIdx;
-          resp.result = TP_END_LOOP;
-          return resp;
-        }
-      }
-      resp.result = TP_NEXT_LINE;
-      return resp;
-    }
-
-    // First time — parse FOR var = start TO limit [STEP step]
+    // Always consume the FOR header tokens (`= start TO limit [STEP n]`)
+    // so the dispatcher's pos lands on the body / EOL afterward — even
+    // in iter mode. Without this, returning TP_NEXT_TOKEN from iter
+    // mode would leave pos at TOK_EQUAL, and the main dispatch would
+    // then walk into the literal-length byte of "1" (which happens to
+    // be 0x01 = TOK_CONTINUE), firing CALL CONTINUE on every iteration.
     float startVal = 0, limitVal = 0, stepVal = 1;
-
     if (tokens[*pos] == TOK_EQUAL)
     {
       (*pos)++;
@@ -1162,7 +1894,35 @@ private:
       stepVal = m_expr.evalNumeric(tokens, pos);
     }
 
-    // Set the loop variable
+    if (stackIdx >= 0)
+    {
+      // Iteration — increment and check limit (header already consumed)
+      ForFrame* f = &m_forStack[stackIdx];
+      Variable* v = m_vars.findNum(vname, vlen);
+      if (v)
+      {
+        v->numVal += f->step;
+
+        bool done = (f->step > 0) ? (v->numVal > f->limit)
+                                  : (v->numVal < f->limit);
+        if (done)
+        {
+          // Remove this frame and all above it
+          m_forDepth = stackIdx;
+          resp.result = TP_END_LOOP;
+          return resp;
+        }
+      }
+      // Loop continues — let dispatch keep running this line so a
+      // single-line FOR :: BODY :: NEXT actually executes BODY each
+      // iteration. (Multi-line FOR has nothing more on the FOR line,
+      // so the dispatcher hits EOL and the outer code drives to body.)
+      resp.result = TP_NEXT_TOKEN;
+      return resp;
+    }
+
+    // First time through this FOR — header was parsed above. Set the
+    // loop variable to the starting value and push a new FOR frame.
     m_vars.setNum(vname, vlen, startVal);
 
     // Push FOR frame
@@ -1181,7 +1941,9 @@ private:
       f->forLineNum = lineNum;
     }
 
-    resp.result = TP_NEXT_LINE;
+    // First-time setup done — keep dispatching this line so body
+    // statements after FOR (`FOR I=1 TO 9 :: PRINT I :: NEXT I`) run.
+    resp.result = TP_NEXT_TOKEN;
     return resp;
   }
 
@@ -1192,10 +1954,16 @@ private:
 
     // Optional variable name after NEXT
     char varName[MAX_VAR_NAME] = "";
+    int  varLen = 0;
     if (isIdentStart(tokens[*pos]))
     {
       bool isStr;
-      parseIdent(tokens, pos, varName, sizeof(varName), &isStr);
+      varLen = parseIdent(tokens, pos, varName, sizeof(varName), &isStr);
+      // Uppercase to match how execFor stores names
+      for (int i = 0; i < varLen; i++)
+      {
+        if (varName[i] >= 'a' && varName[i] <= 'z') varName[i] -= 32;
+      }
     }
 
     if (m_forDepth <= 0)
@@ -1205,9 +1973,29 @@ private:
       return resp;
     }
 
-    // Find the matching FOR frame (top of stack if no variable specified)
-    ForFrame* f = &m_forStack[m_forDepth - 1];
+    // If a variable name was given, search the FOR stack for it and
+    // pop any inner frames sitting above. (Real TI behavior — solves
+    // nested-loop edge cases where a stale inner frame lingers after
+    // an early exit.) No name = use the top of stack.
+    int idx = m_forDepth - 1;
+    if (varLen > 0)
+    {
+      while (idx >= 0 &&
+             strcasecmp(m_forStack[idx].varName, varName) != 0)
+      {
+        idx--;
+      }
+      if (idx < 0)
+      {
+        resp.result = TP_ERROR;
+        snprintf(resp.errorMsg, sizeof(resp.errorMsg),
+                 "FOR-NEXT MISMATCH");
+        return resp;
+      }
+      m_forDepth = idx + 1;   // pop everything above the match
+    }
 
+    ForFrame* f = &m_forStack[idx];
     resp.result = TP_NEXT_LOOP;
     resp.lineNum = f->forLineNum;
     return resp;
@@ -1276,12 +2064,12 @@ private:
           int r = row - 1;
           int c = col - 1 + i;
           // Wrap to next line if overflow (TI behavior)
-          while (c >= 28)
+          while (c >= TI_COLS)
           {
-            c -= 28;
+            c -= TI_COLS;
             r++;
           }
-          if (r >= 0 && r < 24)
+          if (r >= 0 && r < TI_ROWS)
           {
             m_setChar(r, c, (char)ch);
           }
@@ -1307,12 +2095,12 @@ private:
           int r = row - 1 + i;
           int c = col - 1;
           // Wrap to next column if overflow
-          while (r >= 24)
+          while (r >= TI_ROWS)
           {
-            r -= 24;
+            r -= TI_ROWS;
             c++;
           }
-          if (r >= 0 && r < 24 && c >= 0 && c < 28)
+          if (r >= 0 && r < TI_ROWS && c >= 0 && c < TI_COLS)
           {
             m_setChar(r, c, (char)ch);
           }
@@ -1336,7 +2124,7 @@ private:
         bool vIsStr;
         int vlen = parseIdent(tokens, pos, vname, sizeof(vname), &vIsStr);
         char ch = 32;
-        if (m_getChar && row >= 1 && row <= 24 && col >= 1 && col <= 28)
+        if (m_getChar && row >= 1 && row <= TI_ROWS && col >= 1 && col <= TI_COLS)
         {
           ch = m_getChar(row - 1, col - 1);
         }
@@ -1380,6 +2168,525 @@ private:
         }
       }
       if (tokens[*pos] == TOK_RPAREN) (*pos)++;
+      return resp;
+    }
+
+    if (strcasecmp(subName, "ERR") == 0)
+    {
+      // CALL ERR(err-num, severity, code, line) — returns info about the
+      // last error caught by ON ERROR. Stub: we don't classify errors
+      // yet, so err-num/severity/code are 0 and line is the line where
+      // the last error occurred.
+      if (tokens[*pos] == TOK_LPAREN) (*pos)++;
+      const char* names[4] = {"", "", "", ""};
+      char buf[4][MAX_VAR_NAME];
+      int lens[4] = {0, 0, 0, 0};
+      for (int i = 0; i < 4; i++)
+      {
+        if (tokens[*pos] == TOK_RPAREN || tokens[*pos] == TOK_EOL) break;
+        if (isIdentStart(tokens[*pos]))
+        {
+          bool isStr;
+          lens[i] = parseIdent(tokens, pos, buf[i], sizeof(buf[i]), &isStr);
+          names[i] = buf[i];
+        }
+        if (tokens[*pos] == TOK_COMMA) (*pos)++;
+      }
+      if (tokens[*pos] == TOK_RPAREN) (*pos)++;
+      float vals[4] = {0, 0, 0, (float)m_lastErrorLine};
+      for (int i = 0; i < 4; i++)
+      {
+        if (lens[i] > 0) m_vars.setNum(names[i], lens[i], vals[i]);
+      }
+      return resp;
+    }
+
+    // --- Sprite support (Phase 1: create / delete / locate / pattern /
+    //     magnify). Motion + collision detection land in Phase 2/3.
+    if (strcasecmp(subName, "SPRITE") == 0)
+    {
+      // CALL SPRITE(#n, char, color, row, col [, rVel, cVel] [, #n, ...])
+      if (tokens[*pos] == TOK_LPAREN) (*pos)++;
+      while (tokens[*pos] != TOK_RPAREN && tokens[*pos] != TOK_EOL &&
+             tokens[*pos] != TOK_COLON && tokens[*pos] != TOK_BANG)
+      {
+        if (tokens[*pos] == TOK_HASH) (*pos)++;
+        int n = (int)m_expr.evalNumeric(tokens, pos);
+        if (!sprites::validSlot(n)) break;
+        sprites::Sprite& s = sprites::g_sprites[n];
+        if (s.active && m_spriteErase) m_spriteErase(n);
+        if (tokens[*pos] == TOK_COMMA) (*pos)++;
+        s.charCode = (uint8_t)m_expr.evalNumeric(tokens, pos);
+        if (tokens[*pos] == TOK_COMMA) (*pos)++;
+        s.colorIdx = (uint8_t)m_expr.evalNumeric(tokens, pos);
+        if (tokens[*pos] == TOK_COMMA) (*pos)++;
+        s.row      = (int16_t)m_expr.evalNumeric(tokens, pos);
+        if (tokens[*pos] == TOK_COMMA) (*pos)++;
+        s.col      = (int16_t)m_expr.evalNumeric(tokens, pos);
+        // Optional velocity args. Only consume if a comma is followed
+        // by something other than `#` (which would start the next
+        // sprite in a multi-arg `CALL SPRITE(#1,...,#2,...)`).
+        s.rowVel = 0; s.colVel = 0;
+        if (tokens[*pos] == TOK_COMMA && tokens[*pos + 1] != TOK_HASH)
+        {
+          (*pos)++;
+          s.rowVel = (int16_t)m_expr.evalNumeric(tokens, pos);
+          if (tokens[*pos] == TOK_COMMA) (*pos)++;
+          s.colVel = (int16_t)m_expr.evalNumeric(tokens, pos);
+        }
+        s.magnify = sprites::g_magnify;
+        s.active  = true;
+        // Seed snapshot so a POSITION/COINC right after CALL SPRITE
+        // returns the just-set position instead of the default (1,1).
+        s.snapRow     = s.row;
+        s.snapCol     = s.col;
+        s.snapMagnify = s.magnify;
+        if (m_spriteDraw) m_spriteDraw(n);
+        if (tokens[*pos] == TOK_COMMA) (*pos)++;
+      }
+      if (tokens[*pos] == TOK_RPAREN) (*pos)++;
+      return resp;
+    }
+
+    if (strcasecmp(subName, "DELSPRITE") == 0)
+    {
+      // CALL DELSPRITE(#n [, #n ...]) or CALL DELSPRITE(ALL)
+      if (tokens[*pos] == TOK_LPAREN) (*pos)++;
+      if (tokens[*pos] == TOK_ALL)
+      {
+        (*pos)++;
+        for (int i = 1; i <= sprites::MAX_SPRITES; i++)
+        {
+          if (sprites::g_sprites[i].active)
+          {
+            if (m_spriteErase) m_spriteErase(i);
+            sprites::g_sprites[i].active = false;
+          }
+        }
+      }
+      else
+      {
+        while (tokens[*pos] != TOK_RPAREN && tokens[*pos] != TOK_EOL &&
+               tokens[*pos] != TOK_COLON && tokens[*pos] != TOK_BANG)
+        {
+          if (tokens[*pos] == TOK_HASH) (*pos)++;
+          int n = (int)m_expr.evalNumeric(tokens, pos);
+          if (sprites::validSlot(n) && sprites::g_sprites[n].active)
+          {
+            if (m_spriteErase) m_spriteErase(n);
+            sprites::g_sprites[n].active = false;
+          }
+          if (tokens[*pos] == TOK_COMMA) (*pos)++;
+        }
+      }
+      if (tokens[*pos] == TOK_RPAREN) (*pos)++;
+      return resp;
+    }
+
+    if (strcasecmp(subName, "LOCATE") == 0)
+    {
+      // CALL LOCATE(#n, row, col [, #n, row, col ...])
+      if (tokens[*pos] == TOK_LPAREN) (*pos)++;
+      while (tokens[*pos] != TOK_RPAREN && tokens[*pos] != TOK_EOL &&
+             tokens[*pos] != TOK_COLON && tokens[*pos] != TOK_BANG)
+      {
+        if (tokens[*pos] == TOK_HASH) (*pos)++;
+        int n = (int)m_expr.evalNumeric(tokens, pos);
+        if (tokens[*pos] == TOK_COMMA) (*pos)++;
+        int r = (int)m_expr.evalNumeric(tokens, pos);
+        if (tokens[*pos] == TOK_COMMA) (*pos)++;
+        int c = (int)m_expr.evalNumeric(tokens, pos);
+        if (sprites::validSlot(n) && sprites::g_sprites[n].active)
+        {
+          if (m_spriteErase) m_spriteErase(n);
+          sprites::g_sprites[n].row     = (int16_t)r;
+          sprites::g_sprites[n].col     = (int16_t)c;
+          sprites::g_sprites[n].snapRow = (int16_t)r;
+          sprites::g_sprites[n].snapCol = (int16_t)c;
+          if (m_spriteDraw) m_spriteDraw(n);
+        }
+        if (tokens[*pos] == TOK_COMMA) (*pos)++;
+      }
+      if (tokens[*pos] == TOK_RPAREN) (*pos)++;
+      return resp;
+    }
+
+    if (strcasecmp(subName, "PATTERN") == 0)
+    {
+      // CALL PATTERN(#n, char-code [, #n, char-code ...])
+      if (tokens[*pos] == TOK_LPAREN) (*pos)++;
+      while (tokens[*pos] != TOK_RPAREN && tokens[*pos] != TOK_EOL &&
+             tokens[*pos] != TOK_COLON && tokens[*pos] != TOK_BANG)
+      {
+        if (tokens[*pos] == TOK_HASH) (*pos)++;
+        int n = (int)m_expr.evalNumeric(tokens, pos);
+        if (tokens[*pos] == TOK_COMMA) (*pos)++;
+        int code = (int)m_expr.evalNumeric(tokens, pos);
+        if (sprites::validSlot(n) && sprites::g_sprites[n].active)
+        {
+          if (m_spriteErase) m_spriteErase(n);
+          sprites::g_sprites[n].charCode = (uint8_t)code;
+          if (m_spriteDraw) m_spriteDraw(n);
+        }
+        if (tokens[*pos] == TOK_COMMA) (*pos)++;
+      }
+      if (tokens[*pos] == TOK_RPAREN) (*pos)++;
+      return resp;
+    }
+
+    if (strcasecmp(subName, "POSITION") == 0)
+    {
+      // CALL POSITION(#n, row-var, col-var [, #n, row-var, col-var ...])
+      // Writes the sprite's current TI-pixel coordinates into the
+      // listed numeric variables.
+      if (tokens[*pos] == TOK_LPAREN) (*pos)++;
+      while (tokens[*pos] != TOK_RPAREN && tokens[*pos] != TOK_EOL &&
+             tokens[*pos] != TOK_COLON && tokens[*pos] != TOK_BANG)
+      {
+        if (tokens[*pos] == TOK_HASH) (*pos)++;
+        int n = (int)m_expr.evalNumeric(tokens, pos);
+        if (tokens[*pos] == TOK_COMMA) (*pos)++;
+        // row variable
+        char rname[MAX_VAR_NAME]; int rlen = 0; bool rIsStr;
+        if (isIdentStart(tokens[*pos]))
+        {
+          rlen = parseIdent(tokens, pos, rname, sizeof(rname), &rIsStr);
+        }
+        if (tokens[*pos] == TOK_COMMA) (*pos)++;
+        // col variable
+        char cname[MAX_VAR_NAME]; int clen = 0; bool cIsStr;
+        if (isIdentStart(tokens[*pos]))
+        {
+          clen = parseIdent(tokens, pos, cname, sizeof(cname), &cIsStr);
+        }
+        if (sprites::validSlot(n) && sprites::g_sprites[n].active)
+        {
+          // snapRow/snapCol = position at the end of the last
+          // spriteTick, so all queries within one BASIC iteration
+          // are coherent even if a tick fires between them.
+          if (rlen > 0)
+            m_vars.setNum(rname, rlen,
+                          (float)sprites::g_sprites[n].snapRow);
+          if (clen > 0)
+            m_vars.setNum(cname, clen,
+                          (float)sprites::g_sprites[n].snapCol);
+        }
+        if (tokens[*pos] == TOK_COMMA) (*pos)++;
+      }
+      if (tokens[*pos] == TOK_RPAREN) (*pos)++;
+      return resp;
+    }
+
+    if (strcasecmp(subName, "DISTANCE") == 0)
+    {
+      // CALL DISTANCE(#s1, #s2, var)            — sprite-sprite
+      // CALL DISTANCE(#s, row, col, var)        — sprite-point
+      // Returns sum of squared row/col deltas (TI convention; no sqrt).
+      if (tokens[*pos] == TOK_LPAREN) (*pos)++;
+      if (tokens[*pos] == TOK_HASH) (*pos)++;
+      int s1 = (int)m_expr.evalNumeric(tokens, pos);
+      if (tokens[*pos] == TOK_COMMA) (*pos)++;
+      int r1 = 0, c1 = 0, valid1 = 0;
+      if (sprites::validSlot(s1) && sprites::g_sprites[s1].active)
+      {
+        r1 = sprites::g_sprites[s1].snapRow;
+        c1 = sprites::g_sprites[s1].snapCol;
+        valid1 = 1;
+      }
+      // Second arg may be #spriteN or a row literal
+      int r2 = 0, c2 = 0, valid2 = 0;
+      if (tokens[*pos] == TOK_HASH)
+      {
+        (*pos)++;
+        int s2 = (int)m_expr.evalNumeric(tokens, pos);
+        if (sprites::validSlot(s2) && sprites::g_sprites[s2].active)
+        {
+          r2 = sprites::g_sprites[s2].snapRow;
+          c2 = sprites::g_sprites[s2].snapCol;
+          valid2 = 1;
+        }
+        if (tokens[*pos] == TOK_COMMA) (*pos)++;
+      }
+      else
+      {
+        r2 = (int)m_expr.evalNumeric(tokens, pos);
+        if (tokens[*pos] == TOK_COMMA) (*pos)++;
+        c2 = (int)m_expr.evalNumeric(tokens, pos);
+        if (tokens[*pos] == TOK_COMMA) (*pos)++;
+        valid2 = 1;
+      }
+      // Result variable
+      char vname[MAX_VAR_NAME]; int vlen = 0; bool vIsStr;
+      if (isIdentStart(tokens[*pos]))
+      {
+        vlen = parseIdent(tokens, pos, vname, sizeof(vname), &vIsStr);
+      }
+      if (tokens[*pos] == TOK_RPAREN) (*pos)++;
+      if (valid1 && valid2 && vlen > 0)
+      {
+        long dr = r1 - r2, dc = c1 - c2;
+        m_vars.setNum(vname, vlen, (float)(dr * dr + dc * dc));
+      }
+      else if (vlen > 0)
+      {
+        // Sprite inactive — TI returns -1
+        m_vars.setNum(vname, vlen, -1.0f);
+      }
+      return resp;
+    }
+
+    if (strcasecmp(subName, "COINC") == 0)
+    {
+      // CALL COINC(#s1, #s2, tolerance, var)         — sprite pair
+      // CALL COINC(#s, row, col, tolerance, var)     — sprite-point
+      // CALL COINC(ALL, var)                         — any pair?
+      // Result: -1 if coincident within tolerance, 0 otherwise.
+      if (tokens[*pos] == TOK_LPAREN) (*pos)++;
+
+      if (tokens[*pos] == TOK_ALL)
+      {
+        (*pos)++;
+        if (tokens[*pos] == TOK_COMMA) (*pos)++;
+        char vname[MAX_VAR_NAME]; int vlen = 0; bool vIsStr;
+        if (isIdentStart(tokens[*pos]))
+        {
+          vlen = parseIdent(tokens, pos, vname, sizeof(vname), &vIsStr);
+        }
+        if (tokens[*pos] == TOK_RPAREN) (*pos)++;
+        // Check every active pair for any overlap (8-px box per side
+        // of magnify-1 sprite, scale up for magnified).
+        int hit = 0;
+        for (int a = 1; a <= sprites::MAX_SPRITES && !hit; a++)
+        {
+          if (!sprites::g_sprites[a].active) continue;
+          for (int b = a + 1; b <= sprites::MAX_SPRITES && !hit; b++)
+          {
+            if (!sprites::g_sprites[b].active) continue;
+            int sa = sprites::footprint(sprites::g_sprites[a].snapMagnify);
+            int sb = sprites::footprint(sprites::g_sprites[b].snapMagnify);
+            int ra = sprites::g_sprites[a].snapRow;
+            int ca = sprites::g_sprites[a].snapCol;
+            int rb = sprites::g_sprites[b].snapRow;
+            int cb = sprites::g_sprites[b].snapCol;
+            if (ra < rb + sb && rb < ra + sa &&
+                ca < cb + sb && cb < ca + sa) hit = -1;
+          }
+        }
+        if (vlen > 0) m_vars.setNum(vname, vlen, (float)hit);
+        return resp;
+      }
+
+      if (tokens[*pos] == TOK_HASH) (*pos)++;
+      int s1 = (int)m_expr.evalNumeric(tokens, pos);
+      if (tokens[*pos] == TOK_COMMA) (*pos)++;
+
+      bool spritePair = (tokens[*pos] == TOK_HASH);
+      int s2 = 0, r2 = 0, c2 = 0;
+      if (spritePair)
+      {
+        (*pos)++;
+        s2 = (int)m_expr.evalNumeric(tokens, pos);
+        if (tokens[*pos] == TOK_COMMA) (*pos)++;
+      }
+      else
+      {
+        r2 = (int)m_expr.evalNumeric(tokens, pos);
+        if (tokens[*pos] == TOK_COMMA) (*pos)++;
+        c2 = (int)m_expr.evalNumeric(tokens, pos);
+        if (tokens[*pos] == TOK_COMMA) (*pos)++;
+      }
+
+      int tolerance = (int)m_expr.evalNumeric(tokens, pos);
+      if (tokens[*pos] == TOK_COMMA) (*pos)++;
+
+      char vname[MAX_VAR_NAME]; int vlen = 0; bool vIsStr;
+      if (isIdentStart(tokens[*pos]))
+      {
+        vlen = parseIdent(tokens, pos, vname, sizeof(vname), &vIsStr);
+      }
+      if (tokens[*pos] == TOK_RPAREN) (*pos)++;
+
+      int result = 0;
+      if (sprites::validSlot(s1) && sprites::g_sprites[s1].active)
+      {
+        int r1 = sprites::g_sprites[s1].snapRow;
+        int c1 = sprites::g_sprites[s1].snapCol;
+        int rr, cc;
+        if (spritePair && sprites::validSlot(s2) &&
+            sprites::g_sprites[s2].active)
+        {
+          rr = sprites::g_sprites[s2].snapRow;
+          cc = sprites::g_sprites[s2].snapCol;
+        }
+        else if (!spritePair)
+        {
+          rr = r2; cc = c2;
+        }
+        else
+        {
+          if (vlen > 0) m_vars.setNum(vname, vlen, 0.0f);
+          return resp;
+        }
+        long dr = r1 - rr, dc = c1 - cc;
+        if (dr < 0) dr = -dr;
+        if (dc < 0) dc = -dc;
+        if (dr <= tolerance && dc <= tolerance) result = -1;
+      }
+      if (vlen > 0) m_vars.setNum(vname, vlen, (float)result);
+      return resp;
+    }
+
+    if (strcasecmp(subName, "MOTION") == 0)
+    {
+      // CALL MOTION(#n, rowVel, colVel [, #n, rowVel, colVel ...])
+      // Velocity range -128..127. Effective pixel motion is vel/8 per
+      // 60 Hz frame, integrated by the sketch's spriteTick().
+      if (tokens[*pos] == TOK_LPAREN) (*pos)++;
+      while (tokens[*pos] != TOK_RPAREN && tokens[*pos] != TOK_EOL &&
+             tokens[*pos] != TOK_COLON && tokens[*pos] != TOK_BANG)
+      {
+        if (tokens[*pos] == TOK_HASH) (*pos)++;
+        int n = (int)m_expr.evalNumeric(tokens, pos);
+        if (tokens[*pos] == TOK_COMMA) (*pos)++;
+        int rv = (int)m_expr.evalNumeric(tokens, pos);
+        if (tokens[*pos] == TOK_COMMA) (*pos)++;
+        int cv = (int)m_expr.evalNumeric(tokens, pos);
+        if (sprites::validSlot(n) && sprites::g_sprites[n].active)
+        {
+          sprites::g_sprites[n].rowVel = (int16_t)rv;
+          sprites::g_sprites[n].colVel = (int16_t)cv;
+          // Reset accumulators so a fresh velocity starts cleanly
+          sprites::g_sprites[n].subRow = 0;
+          sprites::g_sprites[n].subCol = 0;
+        }
+        if (tokens[*pos] == TOK_COMMA) (*pos)++;
+      }
+      if (tokens[*pos] == TOK_RPAREN) (*pos)++;
+      return resp;
+    }
+
+    if (strcasecmp(subName, "MAGNIFY") == 0)
+    {
+      // CALL MAGNIFY(size) — size 1..4
+      if (tokens[*pos] == TOK_LPAREN) (*pos)++;
+      int size = (int)m_expr.evalNumeric(tokens, pos);
+      if (size < 1) size = 1;
+      if (size > 4) size = 4;
+      // All future sprites inherit this magnify. For existing sprites,
+      // re-apply so they render at the new size (TI behavior).
+      sprites::g_magnify = (uint8_t)size;
+      for (int i = 1; i <= sprites::MAX_SPRITES; i++)
+      {
+        if (sprites::g_sprites[i].active)
+        {
+          if (m_spriteErase) m_spriteErase(i);
+          sprites::g_sprites[i].magnify = (uint8_t)size;
+          if (m_spriteDraw) m_spriteDraw(i);
+        }
+      }
+      if (tokens[*pos] == TOK_RPAREN) (*pos)++;
+      return resp;
+    }
+
+    if (strcasecmp(subName, "TIMER") == 0)
+    {
+      // CALL TIMER(numeric-var) — write current millis() into the var.
+      // Use it to measure elapsed time between two points:
+      //   100 CALL TIMER(T0)
+      //   ... do stuff ...
+      //   200 CALL TIMER(T1)
+      //   210 PRINT "ELAPSED MS:";T1-T0
+      if (tokens[*pos] == TOK_LPAREN) (*pos)++;
+      if (isIdentStart(tokens[*pos]))
+      {
+        char vname[MAX_VAR_NAME];
+        bool isStr;
+        int vlen = parseIdent(tokens, pos, vname, sizeof(vname), &isStr);
+        m_vars.setNum(vname, vlen, (float)millis());
+      }
+      if (tokens[*pos] == TOK_RPAREN) (*pos)++;
+      return resp;
+    }
+
+    if (strcasecmp(subName, "DELAY") == 0)
+    {
+      // CALL DELAY(ms) — block for ms milliseconds. Yields to the BLE
+      // task / display refresh / sprite ticker so the simulator stays
+      // responsive during the wait.
+      if (tokens[*pos] == TOK_LPAREN) (*pos)++;
+      long ms = (long)m_expr.evalNumeric(tokens, pos);
+      if (tokens[*pos] == TOK_RPAREN) (*pos)++;
+      if (ms > 0) delay((unsigned long)ms);
+      return resp;
+    }
+
+    if (strcasecmp(subName, "SPEED") == 0)
+    {
+      // CALL SPEED(microsecondsPerLine)
+      //   0    = unthrottled (default, native ESP32 speed)
+      //   285  ≈ TI Extended BASIC authentic speed
+      //   666  ≈ stock TI BASIC authentic speed
+      // Helps with games written for the original TI's pace.
+      if (tokens[*pos] == TOK_LPAREN) (*pos)++;
+      unsigned long us = (unsigned long)m_expr.evalNumeric(tokens, pos);
+      if (tokens[*pos] == TOK_RPAREN) (*pos)++;
+      if (m_setThrottle) m_setThrottle(us);
+      return resp;
+    }
+
+    if (strcasecmp(subName, "SOUND") == 0)
+    {
+      // CALL SOUND(duration, freq1, vol1 [, freq2, vol2, freq3, vol3,
+      //                                    freq4, vol4])
+      //   duration  : milliseconds, 1..4250 (i.e. .001 to 4.250 sec)
+      //   freq      : Hz, or -1..-8 for noise channels
+      //   volume    : 0 (loudest) to 30 (silent)
+      //
+      // TI semantics:
+      //   - Sounds play asynchronously; the program keeps running.
+      //   - A new CALL SOUND with positive duration waits for the
+      //     PREVIOUS sound to finish before starting (and returning).
+      //   - Negative duration cancels any current sound and starts
+      //     the new one immediately, returning right away.
+      //
+      // Stub: no audio wired yet, so we simulate the timing only.
+      // Programs that use CALL SOUND for pacing will run at the
+      // right speed; programs that listen for the notes won't hear
+      // anything.
+      if (tokens[*pos] == TOK_LPAREN) (*pos)++;
+      int duration = (int)m_expr.evalNumeric(tokens, pos);
+      int voices = 0;
+      while (tokens[*pos] == TOK_COMMA && voices < 4)
+      {
+        (*pos)++;
+        m_expr.evalNumeric(tokens, pos);   // frequency — ignored for now
+        if (tokens[*pos] == TOK_COMMA) (*pos)++;
+        m_expr.evalNumeric(tokens, pos);   // volume   — ignored for now
+        voices++;
+      }
+      if (tokens[*pos] == TOK_RPAREN) (*pos)++;
+
+      int absDur = (duration >= 0) ? duration : -duration;
+      if (absDur > 4250) absDur = 4250;
+
+      if (duration > 0)
+      {
+        // Wait for any previous sound's scheduled end time, then
+        // schedule this new sound and return.
+        unsigned long now = millis();
+        while (now < m_soundEndTime)
+        {
+          delay(10);
+          now = millis();
+        }
+        m_soundEndTime = now + (unsigned long)absDur;
+      }
+      else
+      {
+        // Negative duration cancels in-flight sound and schedules
+        // the new one; return immediately.
+        m_soundEndTime = millis() + (unsigned long)absDur;
+      }
       return resp;
     }
 
@@ -1460,6 +2767,40 @@ private:
       return resp;
     }
 
+    if (strcasecmp(subName, "JOYST") == 0)
+    {
+      // CALL JOYST(unit, X, Y) — unit is 1 (only one pad supported);
+      // X and Y get -4/0/+4 from the BLE gamepad's D-pad / hat or from
+      // the keyboard's arrow keys (whichever is active).
+      if (tokens[*pos] == TOK_LPAREN) (*pos)++;
+      int unit = (int)m_expr.evalNumeric(tokens, pos);
+      if (tokens[*pos] == TOK_COMMA) (*pos)++;
+
+      char xVar[MAX_VAR_NAME] = "";
+      int xLen = 0;
+      if (isIdentStart(tokens[*pos]))
+      {
+        bool vIsStr;
+        xLen = parseIdent(tokens, pos, xVar, sizeof(xVar), &vIsStr);
+      }
+      if (tokens[*pos] == TOK_COMMA) (*pos)++;
+
+      char yVar[MAX_VAR_NAME] = "";
+      int yLen = 0;
+      if (isIdentStart(tokens[*pos]))
+      {
+        bool vIsStr;
+        yLen = parseIdent(tokens, pos, yVar, sizeof(yVar), &vIsStr);
+      }
+      if (tokens[*pos] == TOK_RPAREN) (*pos)++;
+
+      int x = 0, y = 0;
+      if (m_readJoystick) m_readJoystick(unit, &x, &y);
+      if (xLen > 0) m_vars.setNum(xVar, xLen, (float)x);
+      if (yLen > 0) m_vars.setNum(yVar, yLen, (float)y);
+      return resp;
+    }
+
     if (strcasecmp(subName, "CHAR") == 0)
     {
       // CALL CHAR(char_code, "hex_string")
@@ -1501,6 +2842,112 @@ private:
       return resp;
     }
 
+    // User-defined subprogram lookup — CALL name(args)
+    {
+      int nameLen = (int)strlen(subName);
+      SubDef* sd = m_vars.findSub(subName, nameLen);
+      if (sd != NULL)
+      {
+        TPResponse out;
+        out.result = TP_CALL_SUB;
+        out.errorMsg[0] = '\0';
+        out.aliasCount = 0;
+
+        // Bind positional arguments to parameter names. Parameters are
+        // stored as raw-ASCII identifier token slices separated by commas.
+        if (tokens[*pos] == TOK_LPAREN) (*pos)++;
+
+        // Walk the saved paramTokens and the caller's arg list in parallel.
+        int pp = 0;
+        while (pp < sd->paramTokensLen)
+        {
+          // Skip commas between params
+          if (sd->paramTokens[pp] == TOK_COMMA) { pp++; continue; }
+          if (!isIdentStart(sd->paramTokens[pp])) { pp++; continue; }
+
+          char pname[16];
+          int pLen = 0;
+          while (pp < sd->paramTokensLen &&
+                 isIdentCont(sd->paramTokens[pp]) &&
+                 pLen < 15)
+          {
+            pname[pLen++] = (char)sd->paramTokens[pp++];
+          }
+          bool pIsStr = (pLen > 0 && pname[pLen - 1] == '$');
+
+          // Evaluate the matching caller argument (skip leading comma)
+          if (tokens[*pos] == TOK_COMMA) (*pos)++;
+          if (tokens[*pos] == TOK_RPAREN ||
+              tokens[*pos] == TOK_EOL ||
+              tokens[*pos] == TOK_COLON)
+          {
+            break;   // too few args — just stop
+          }
+
+          // Pass-by-value-result detection: if the caller's arg is a bare
+          // variable (ident followed by comma / rparen / eol / colon),
+          // record an alias so SUBEND copies the sub's final value back
+          // into the caller's variable.
+          char callerName[12];
+          int  callerLen = 0;
+          bool isBareVar = false;
+          bool callerIsStr = false;
+          if (isIdentStart(tokens[*pos]))
+          {
+            int probe = *pos;
+            while (isIdentCont(tokens[probe]) && callerLen < 11)
+            {
+              callerName[callerLen++] = (char)tokens[probe++];
+            }
+            uint8_t nxt = tokens[probe];
+            if (nxt == TOK_COMMA || nxt == TOK_RPAREN ||
+                nxt == TOK_EOL   || nxt == TOK_COLON)
+            {
+              isBareVar = true;
+              callerIsStr = (callerLen > 0 &&
+                             callerName[callerLen - 1] == '$');
+            }
+            else
+            {
+              callerLen = 0;   // not bare — reset
+            }
+          }
+
+          if (pIsStr)
+          {
+            char argBuf[MAX_STR_LEN];
+            m_expr.evalString(tokens, pos, argBuf, sizeof(argBuf));
+            m_vars.setStr(pname, pLen, argBuf);
+          }
+          else
+          {
+            float v = m_expr.evalNumeric(tokens, pos);
+            m_vars.setNum(pname, pLen, v);
+          }
+
+          if (isBareVar && pIsStr == callerIsStr &&
+              out.aliasCount < 6)
+          {
+            TPSubAlias& a = out.aliases[out.aliasCount];
+            int i;
+            for (i = 0; i < pLen && i < 11; i++) a.paramName[i] = pname[i];
+            a.paramName[i] = '\0';
+            a.paramLen = (uint8_t)pLen;
+            for (i = 0; i < callerLen && i < 11; i++) a.callerName[i] = callerName[i];
+            a.callerName[i] = '\0';
+            a.callerLen = (uint8_t)callerLen;
+            a.isStr = pIsStr;
+            out.aliasCount++;
+          }
+        }
+        if (tokens[*pos] == TOK_RPAREN) (*pos)++;
+
+        // Jump to the first body line (SUB declaration index + 1).
+        out.lineIdx = sd->declLineIdx;   // EM advances to body = idx+1
+        return out;
+      }
+    }
+
     resp.result = TP_ERROR;
     snprintf(resp.errorMsg, sizeof(resp.errorMsg),
              "BAD NAME: %s", subName);
@@ -1515,6 +2962,28 @@ private:
     resp.result = TP_NEED_INPUT;
     resp.errorMsg[0] = '\0';
     resp.prompt[0] = '\0';
+
+    // INPUT #n [, REC k] / LINPUT #n — read from a file unit instead of user.
+    if (tokens[*pos] == TOK_HASH)
+    {
+      (*pos)++;
+      int unit = (int)m_expr.evalNumeric(tokens, pos);
+      if (tokens[*pos] == TOK_COMMA && tokens[*pos + 1] == TOK_REC)
+      {
+        (*pos)++;   // comma
+        (*pos)++;   // REC
+        if (tokens[*pos] == TOK_EQUAL) (*pos)++;
+        long rec = (long)m_expr.evalNumeric(tokens, pos);
+        if (m_fileSeekRec) m_fileSeekRec(unit, rec);
+      }
+      if (tokens[*pos] == TOK_COLON) (*pos)++;
+      execInputFile(tokens, pos, unit);
+      m_linputMode = false;   // reset flag even on file path
+      TPResponse ok;
+      ok.result = TP_NEXT_TOKEN;
+      ok.errorMsg[0] = '\0';
+      return ok;
+    }
 
     // Optional prompt: "text";
     if (tokens[*pos] == TOK_STRING_LIT)
@@ -1543,7 +3012,8 @@ private:
     m_inputVarStart = *pos;
 
     // Skip to end of statement so EM advances past it
-    while (tokens[*pos] != TOK_EOL && tokens[*pos] != TOK_COLON)
+    while (tokens[*pos] != TOK_EOL && tokens[*pos] != TOK_COLON &&
+           tokens[*pos] != TOK_BANG)
     {
       (*pos)++;
     }
@@ -1551,11 +3021,91 @@ private:
     return resp;
   }
 
+  // INPUT #n / LINPUT #n — read a line from the file and assign to
+  // the listed variables. LINPUT takes the whole line into one string;
+  // INPUT splits on commas like interactive INPUT.
+  void execInputFile(const uint8_t* tokens, int* pos, int unit)
+  {
+    char line[MAX_STR_LEN];
+    line[0] = '\0';
+    if (m_fileReadLine)
+    {
+      m_fileReadLine(unit, line, sizeof(line));
+    }
+
+    // LINPUT: first variable gets the full line (if string); extra vars
+    // get empty. For INPUT, split the line on commas.
+    const char* p = line;
+    while (tokens[*pos] != TOK_EOL && tokens[*pos] != TOK_COLON &&
+           tokens[*pos] != TOK_BANG)
+    {
+      if (tokens[*pos] == TOK_COMMA) { (*pos)++; continue; }
+      if (!isIdentStart(tokens[*pos])) { (*pos)++; continue; }
+
+      char vname[MAX_VAR_NAME];
+      bool isStr;
+      int vlen = parseIdent(tokens, pos, vname, sizeof(vname), &isStr);
+
+      char field[MAX_STR_LEN];
+      int fl = 0;
+      if (m_linputMode)
+      {
+        // Whole remaining line goes to first var; subsequent vars empty
+        while (*p && fl < (int)sizeof(field) - 1) field[fl++] = *p++;
+      }
+      else
+      {
+        // Skip leading spaces
+        while (*p == ' ') p++;
+        while (*p && *p != ',' && fl < (int)sizeof(field) - 1)
+        {
+          field[fl++] = *p++;
+        }
+        if (*p == ',') p++;
+      }
+      field[fl] = '\0';
+
+      if (isStr)
+      {
+        m_vars.setStr(vname, vlen, field);
+      }
+      else
+      {
+        m_vars.setNum(vname, vlen, (float)atof(field));
+      }
+    }
+  }
+
   // Called by the EM after user input is received
   void provideInput(const char* input)
   {
     int pos = m_inputVarStart;
     const char* inputPtr = input;
+
+    // LINPUT: the entire line (commas included) goes into the first
+    // string variable. No parsing, no trimming.
+    if (m_linputMode)
+    {
+      m_linputMode = false;
+      while (m_inputTokens[pos] != TOK_EOL &&
+             m_inputTokens[pos] != TOK_COLON &&
+             !isIdentStart(m_inputTokens[pos]))
+      {
+        pos++;
+      }
+      if (isIdentStart(m_inputTokens[pos]))
+      {
+        char vname[MAX_VAR_NAME];
+        bool isStr;
+        int vlen = parseIdent(m_inputTokens, &pos, vname,
+                              sizeof(vname), &isStr);
+        if (isStr)
+        {
+          m_vars.setStr(vname, vlen, input);
+        }
+      }
+      return;
+    }
 
     while (m_inputTokens[pos] != TOK_EOL && m_inputTokens[pos] != TOK_COLON)
     {
