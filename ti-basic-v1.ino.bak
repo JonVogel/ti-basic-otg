@@ -1,0 +1,1866 @@
+/*
+ * TI Extended BASIC Simulator
+ * For ESP32-S3-USB-OTG
+ *
+ * A native TI Extended BASIC interpreter running on the ESP32-S3,
+ * using the onboard 1.3" ST7789 display (240x240) and USB keyboard.
+ *
+ * Display: 30 columns x 24 rows (8x8 pixel characters)
+ * Storage: Programs tokenized in PSRAM, saved as text to SD card
+ *
+ * Board settings (Arduino IDE):
+ *   Board: "ESP32S3 Dev Module"
+ *   PSRAM: "OPI PSRAM"
+ *   USB Mode: "USB-OTG (TinyUSB)"
+ *   USB CDC On Boot: "Enabled"
+ */
+
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h>
+#include <LittleFS.h>
+#include "ti_font.h"
+
+// LCD pins
+#define LCD_DC    4
+#define LCD_CS    5
+#define LCD_SCLK  6
+#define LCD_MOSI  7
+#define LCD_RST   8
+#define LCD_BL    9
+
+// LEDs
+#define LED_GREEN  15
+#define LED_YELLOW 16
+
+// Display geometry
+#define COLS       28
+#define ROWS       24
+#define CHAR_W     8
+#define CHAR_H     8
+#define SCREEN_W   240
+#define SCREEN_H   240
+
+// Display offsets for centering/border
+#define DISPLAY_X_OFFSET 8
+#define DISPLAY_Y_OFFSET 16
+
+// Status bar at the bottom
+#define STATUS_Y   (DISPLAY_Y_OFFSET + ROWS * CHAR_H)
+
+// ---------------------------------------------------------------------------
+// Token definitions
+// ---------------------------------------------------------------------------
+
+// Keywords (0x80 - 0xCF)
+enum Token : uint8_t
+{
+  // Commands (immediate mode)
+  TOK_RUN = 0x80,
+  TOK_NEW,
+  TOK_LIST,
+  TOK_OLD,
+  TOK_SAVE,
+  TOK_BYE,
+  TOK_NUM,        // NUMBER / AUTO
+
+  // Statements
+  TOK_PRINT = 0x90,
+  TOK_GOTO,
+  TOK_GOSUB,
+  TOK_RETURN,
+  TOK_IF,
+  TOK_THEN,
+  TOK_ELSE,
+  TOK_FOR,
+  TOK_TO,
+  TOK_STEP,
+  TOK_NEXT,
+  TOK_LET,
+  TOK_INPUT,
+  TOK_DIM,
+  TOK_REM,
+  TOK_END,
+  TOK_STOP,
+  TOK_DATA,
+  TOK_READ,
+  TOK_RESTORE,
+  TOK_DEF,
+  TOK_ON,
+  TOK_RANDOMIZE,
+  TOK_OPTION,
+  TOK_BASE,
+  TOK_BREAK,
+  TOK_UNBREAK,
+  TOK_CONTINUE,
+  TOK_DISPLAY,
+  TOK_ACCEPT,
+  TOK_CALL,
+  TOK_SUB,
+  TOK_SUBEND,
+  TOK_SUBEXIT,
+  TOK_OPEN,
+  TOK_CLOSE,
+  TOK_DELETE,
+  TOK_LINPUT,
+  TOK_IMAGE,
+  TOK_TRACE,
+  TOK_UNTRACE,
+  TOK_ON_ERROR,
+  TOK_ON_WARNING,
+  TOK_ON_BREAK,
+
+  // Operators (0xD0 - 0xDF)
+  TOK_PLUS = 0xD0,
+  TOK_MINUS,
+  TOK_MULTIPLY,
+  TOK_DIVIDE,
+  TOK_POWER,
+  TOK_EQUAL,
+  TOK_NOT_EQUAL,
+  TOK_LESS,
+  TOK_GREATER,
+  TOK_LESS_EQ,
+  TOK_GREATER_EQ,
+  TOK_AND,
+  TOK_OR,
+  TOK_NOT,
+  TOK_CONCAT,     // & for string concatenation
+
+  // Literal markers (0xE0 - 0xEF)
+  TOK_STRING_LIT = 0xE0,   // followed by uint8_t length, then chars
+  TOK_NUMBER_LIT = 0xE1,   // followed by 4-byte float
+  TOK_VARIABLE   = 0xE2,   // followed by uint8_t length, then name chars
+  TOK_VAR_STRING = 0xE3,   // string variable (name ends with $)
+
+  // Punctuation
+  TOK_LPAREN = 0xF0,
+  TOK_RPAREN,
+  TOK_COMMA,
+  TOK_SEMICOLON,
+  TOK_COLON,        // statement separator
+  TOK_EOL = 0xFF     // end of line marker
+};
+
+// ---------------------------------------------------------------------------
+// Keyword table — maps text to tokens
+// ---------------------------------------------------------------------------
+struct KeywordEntry
+{
+  const char* text;
+  Token token;
+};
+
+static const KeywordEntry keywords[] =
+{
+  // Commands
+  {"RUN",        TOK_RUN},
+  {"NEW",        TOK_NEW},
+  {"LIST",       TOK_LIST},
+  {"OLD",        TOK_OLD},
+  {"SAVE",       TOK_SAVE},
+  {"BYE",        TOK_BYE},
+  {"NUMBER",     TOK_NUM},
+  {"NUM",        TOK_NUM},
+
+  // Statements (longest match first where needed)
+  {"PRINT",      TOK_PRINT},
+  {"DISPLAY",    TOK_DISPLAY},
+  {"ACCEPT",     TOK_ACCEPT},
+  {"GOTO",       TOK_GOTO},
+  {"GO TO",      TOK_GOTO},
+  {"GOSUB",      TOK_GOSUB},
+  {"RETURN",     TOK_RETURN},
+  {"IF",         TOK_IF},
+  {"THEN",       TOK_THEN},
+  {"ELSE",       TOK_ELSE},
+  {"FOR",        TOK_FOR},
+  {"TO",         TOK_TO},
+  {"STEP",       TOK_STEP},
+  {"NEXT",       TOK_NEXT},
+  {"LET",        TOK_LET},
+  {"INPUT",      TOK_INPUT},
+  {"LINPUT",     TOK_LINPUT},
+  {"DIM",        TOK_DIM},
+  {"REM",        TOK_REM},
+  {"END",        TOK_END},
+  {"STOP",       TOK_STOP},
+  {"DATA",       TOK_DATA},
+  {"READ",       TOK_READ},
+  {"RESTORE",    TOK_RESTORE},
+  {"RANDOMIZE",  TOK_RANDOMIZE},
+  {"DEF",        TOK_DEF},
+  {"ON",         TOK_ON},
+  {"OPTION",     TOK_OPTION},
+  {"BASE",       TOK_BASE},
+  {"BREAK",      TOK_BREAK},
+  {"UNBREAK",    TOK_UNBREAK},
+  {"CONTINUE",   TOK_CONTINUE},
+  {"CALL",       TOK_CALL},
+  {"SUB",        TOK_SUB},
+  {"SUBEND",     TOK_SUBEND},
+  {"SUBEXIT",    TOK_SUBEXIT},
+  {"OPEN",       TOK_OPEN},
+  {"CLOSE",      TOK_CLOSE},
+  {"DELETE",     TOK_DELETE},
+  {"IMAGE",      TOK_IMAGE},
+  {"TRACE",      TOK_TRACE},
+  {"UNTRACE",    TOK_UNTRACE},
+
+  // Logical operators
+  {"AND",        TOK_AND},
+  {"OR",         TOK_OR},
+  {"NOT",        TOK_NOT},
+
+  {NULL, TOK_EOL}  // sentinel
+};
+
+// ---------------------------------------------------------------------------
+// Program storage
+// ---------------------------------------------------------------------------
+
+#define MAX_LINES       1000
+#define MAX_LINE_TOKENS 256
+#define MAX_INPUT_LEN   140   // TI Extended BASIC max line length
+
+struct ProgramLine
+{
+  uint16_t lineNum;
+  uint8_t  tokens[MAX_LINE_TOKENS];
+  uint8_t  length;       // number of bytes in tokens[]
+};
+
+static ProgramLine* program[MAX_LINES];  // sorted array of line pointers
+static int programSize = 0;              // number of lines stored
+
+// ---------------------------------------------------------------------------
+// Variable storage
+// ---------------------------------------------------------------------------
+
+#define MAX_VARS 100
+#define MAX_VAR_NAME 16
+
+struct Variable
+{
+  char name[MAX_VAR_NAME];
+  float numVal;
+  char* strVal;       // NULL for numeric variables
+  bool isString;
+};
+
+static Variable vars[MAX_VARS];
+static int varCount = 0;
+
+// Find or create a variable, returns pointer
+static Variable* findVar(const char* name, int nameLen, bool isString)
+{
+  // Search existing
+  for (int i = 0; i < varCount; i++)
+  {
+    if (vars[i].isString == isString &&
+        strlen(vars[i].name) == nameLen &&
+        strncasecmp(vars[i].name, name, nameLen) == 0)
+    {
+      return &vars[i];
+    }
+  }
+
+  // Create new
+  if (varCount >= MAX_VARS)
+  {
+    return NULL;
+  }
+
+  Variable* v = &vars[varCount++];
+  int copyLen = (nameLen < MAX_VAR_NAME - 1) ? nameLen : MAX_VAR_NAME - 1;
+  memcpy(v->name, name, copyLen);
+  v->name[copyLen] = '\0';
+  // Uppercase the name
+  for (int i = 0; i < copyLen; i++)
+  {
+    v->name[i] = toupper(v->name[i]);
+  }
+  v->numVal = 0;
+  v->strVal = NULL;
+  v->isString = isString;
+  return v;
+}
+
+// Clear all variables
+static void clearVars()
+{
+  for (int i = 0; i < varCount; i++)
+  {
+    if (vars[i].strVal)
+    {
+      free(vars[i].strVal);
+      vars[i].strVal = NULL;
+    }
+  }
+  varCount = 0;
+}
+
+// ---------------------------------------------------------------------------
+// FOR/NEXT loop stack
+// ---------------------------------------------------------------------------
+
+#define MAX_FOR_DEPTH 10
+
+struct ForFrame
+{
+  char varName[MAX_VAR_NAME];
+  float limit;
+  float step;
+  int lineIdx;       // program line index of the FOR statement
+};
+
+static ForFrame forStack[MAX_FOR_DEPTH];
+static int forDepth = 0;
+
+static void clearForStack()
+{
+  forDepth = 0;
+}
+
+// ---------------------------------------------------------------------------
+// Expression evaluator (recursive descent)
+// ---------------------------------------------------------------------------
+
+// Forward declarations
+static float evalExpression(const uint8_t* tokens, int* pos);
+static float evalTerm(const uint8_t* tokens, int* pos);
+static float evalFactor(const uint8_t* tokens, int* pos);
+
+// Get a variable's value from token stream
+static float getVarValue(const uint8_t* tokens, int* pos)
+{
+  bool isStr = (tokens[*pos] == TOK_VAR_STRING);
+  (*pos)++;
+  int vlen = tokens[*pos];
+  (*pos)++;
+  Variable* v = findVar((const char*)&tokens[*pos], vlen, isStr);
+  *pos += vlen;
+  if (v)
+  {
+    return v->numVal;
+  }
+  return 0;
+}
+
+// Factor: number, variable, (expression), unary minus
+static float evalFactor(const uint8_t* tokens, int* pos)
+{
+  uint8_t tok = tokens[*pos];
+
+  // Unary minus
+  if (tok == TOK_MINUS)
+  {
+    (*pos)++;
+    return -evalFactor(tokens, pos);
+  }
+
+  // Parenthesized expression
+  if (tok == TOK_LPAREN)
+  {
+    (*pos)++;
+    float val = evalExpression(tokens, pos);
+    if (tokens[*pos] == TOK_RPAREN)
+    {
+      (*pos)++;
+    }
+    return val;
+  }
+
+  // Number literal
+  if (tok == TOK_NUMBER_LIT)
+  {
+    (*pos)++;
+    float val;
+    memcpy(&val, &tokens[*pos], 4);
+    *pos += 4;
+    return val;
+  }
+
+  // Variable
+  if (tok == TOK_VARIABLE || tok == TOK_VAR_STRING)
+  {
+    return getVarValue(tokens, pos);
+  }
+
+  // Built-in functions
+  if (tok == 0xCB) // ABS (using TI token value from ninerpedia)
+  {
+    (*pos)++;
+    if (tokens[*pos] == TOK_LPAREN) (*pos)++;
+    float val = evalExpression(tokens, pos);
+    if (tokens[*pos] == TOK_RPAREN) (*pos)++;
+    return fabs(val);
+  }
+  if (tok == 0xCF) // INT
+  {
+    (*pos)++;
+    if (tokens[*pos] == TOK_LPAREN) (*pos)++;
+    float val = evalExpression(tokens, pos);
+    if (tokens[*pos] == TOK_RPAREN) (*pos)++;
+    return (float)(int)val;
+  }
+  if (tok == 0xD7) // RND
+  {
+    (*pos)++;
+    return (float)random(32767) / 32767.0;
+  }
+
+  // Unknown — skip and return 0
+  (*pos)++;
+  return 0;
+}
+
+// Term: factor (* / ^)
+static float evalTerm(const uint8_t* tokens, int* pos)
+{
+  float val = evalFactor(tokens, pos);
+
+  while (true)
+  {
+    uint8_t tok = tokens[*pos];
+    if (tok == TOK_MULTIPLY)
+    {
+      (*pos)++;
+      val *= evalFactor(tokens, pos);
+    }
+    else if (tok == TOK_DIVIDE)
+    {
+      (*pos)++;
+      float divisor = evalFactor(tokens, pos);
+      if (divisor != 0)
+      {
+        val /= divisor;
+      }
+      else
+      {
+        val = 0; // TODO: error
+      }
+    }
+    else if (tok == TOK_POWER)
+    {
+      (*pos)++;
+      val = pow(val, evalFactor(tokens, pos));
+    }
+    else
+    {
+      break;
+    }
+  }
+
+  return val;
+}
+
+// Expression: term (+ -)
+static float evalExpression(const uint8_t* tokens, int* pos)
+{
+  float val = evalTerm(tokens, pos);
+
+  while (true)
+  {
+    uint8_t tok = tokens[*pos];
+    if (tok == TOK_PLUS)
+    {
+      (*pos)++;
+      val += evalTerm(tokens, pos);
+    }
+    else if (tok == TOK_MINUS)
+    {
+      (*pos)++;
+      val -= evalTerm(tokens, pos);
+    }
+    else
+    {
+      break;
+    }
+  }
+
+  return val;
+}
+
+// Evaluate a comparison (for IF/THEN)
+static bool evalCondition(const uint8_t* tokens, int* pos)
+{
+  float left = evalExpression(tokens, pos);
+  uint8_t op = tokens[*pos];
+  (*pos)++;
+  float right = evalExpression(tokens, pos);
+
+  switch (op)
+  {
+    case TOK_EQUAL:      return left == right;
+    case TOK_NOT_EQUAL:  return left != right;
+    case TOK_LESS:       return left < right;
+    case TOK_GREATER:    return left > right;
+    case TOK_LESS_EQ:    return left <= right;
+    case TOK_GREATER_EQ: return left >= right;
+    default:             return left != 0;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Tokenizer
+// ---------------------------------------------------------------------------
+
+// Skip whitespace in source, return new position
+static int skipSpaces(const char* src, int pos)
+{
+  while (src[pos] == ' ')
+  {
+    pos++;
+  }
+  return pos;
+}
+
+// Try to match a keyword at the current position (case insensitive)
+// Returns the keyword entry index or -1
+static int matchKeyword(const char* src, int pos)
+{
+  int bestMatch = -1;
+  int bestLen = 0;
+
+  for (int i = 0; keywords[i].text != NULL; i++)
+  {
+    const char* kw = keywords[i].text;
+    int klen = strlen(kw);
+    bool match = true;
+
+    for (int j = 0; j < klen; j++)
+    {
+      if (toupper(src[pos + j]) != kw[j])
+      {
+        match = false;
+        break;
+      }
+    }
+
+    // Keyword must not be followed by a letter/digit (to avoid
+    // matching "FOREST" as "FOR" + "EST")
+    if (match && klen > bestLen)
+    {
+      char next = src[pos + klen];
+      if (next == '\0' || !isalnum(next))
+      {
+        bestMatch = i;
+        bestLen = klen;
+      }
+    }
+  }
+
+  return bestMatch;
+}
+
+// Tokenize a source line (without the line number).
+// Returns number of token bytes written, or -1 on error.
+static int tokenizeLine(const char* src, uint8_t* tokens, int maxLen)
+{
+  int pos = 0;
+  int out = 0;
+
+  while (src[pos] != '\0')
+  {
+    pos = skipSpaces(src, pos);
+    if (src[pos] == '\0')
+    {
+      break;
+    }
+
+    // Check for REM — rest of line is literal text
+    if (out > 0 && tokens[out - 1] == TOK_REM)
+    {
+      // Store rest of line as string literal
+      int remLen = strlen(&src[pos]);
+      if (out + 2 + remLen >= maxLen)
+      {
+        return -1;
+      }
+      tokens[out++] = TOK_STRING_LIT;
+      tokens[out++] = (uint8_t)remLen;
+      memcpy(&tokens[out], &src[pos], remLen);
+      out += remLen;
+      break;
+    }
+
+    // Quoted string
+    if (src[pos] == '"')
+    {
+      pos++;
+      int start = pos;
+      while (src[pos] != '\0' && src[pos] != '"')
+      {
+        pos++;
+      }
+      int slen = pos - start;
+      if (src[pos] == '"')
+      {
+        pos++;
+      }
+      if (out + 2 + slen >= maxLen)
+      {
+        return -1;
+      }
+      tokens[out++] = TOK_STRING_LIT;
+      tokens[out++] = (uint8_t)slen;
+      memcpy(&tokens[out], &src[start], slen);
+      out += slen;
+      continue;
+    }
+
+    // Number literal
+    if (isdigit(src[pos]) || (src[pos] == '.' && isdigit(src[pos + 1])))
+    {
+      char* endp;
+      float val = strtof(&src[pos], &endp);
+      pos = endp - src;
+      if (out + 5 >= maxLen)
+      {
+        return -1;
+      }
+      tokens[out++] = TOK_NUMBER_LIT;
+      memcpy(&tokens[out], &val, 4);
+      out += 4;
+      continue;
+    }
+
+    // Operators and punctuation
+    bool foundOp = true;
+    switch (src[pos])
+    {
+      case '+':  tokens[out++] = TOK_PLUS;       pos++; break;
+      case '-':  tokens[out++] = TOK_MINUS;      pos++; break;
+      case '*':  tokens[out++] = TOK_MULTIPLY;   pos++; break;
+      case '/':  tokens[out++] = TOK_DIVIDE;     pos++; break;
+      case '^':  tokens[out++] = TOK_POWER;      pos++; break;
+      case '&':  tokens[out++] = TOK_CONCAT;     pos++; break;
+      case '(':  tokens[out++] = TOK_LPAREN;     pos++; break;
+      case ')':  tokens[out++] = TOK_RPAREN;     pos++; break;
+      case ',':  tokens[out++] = TOK_COMMA;       pos++; break;
+      case ';':  tokens[out++] = TOK_SEMICOLON;  pos++; break;
+      case ':':  tokens[out++] = TOK_COLON;       pos++; break;
+      case '=':  tokens[out++] = TOK_EQUAL;       pos++; break;
+      case '<':
+        if (src[pos + 1] == '=')
+        {
+          tokens[out++] = TOK_LESS_EQ;
+          pos += 2;
+        }
+        else if (src[pos + 1] == '>')
+        {
+          tokens[out++] = TOK_NOT_EQUAL;
+          pos += 2;
+        }
+        else
+        {
+          tokens[out++] = TOK_LESS;
+          pos++;
+        }
+        break;
+      case '>':
+        if (src[pos + 1] == '=')
+        {
+          tokens[out++] = TOK_GREATER_EQ;
+          pos += 2;
+        }
+        else
+        {
+          tokens[out++] = TOK_GREATER;
+          pos++;
+        }
+        break;
+      default:
+        foundOp = false;
+        break;
+    }
+    if (foundOp)
+    {
+      continue;
+    }
+
+    // Try keyword match
+    int kwIdx = matchKeyword(src, pos);
+    if (kwIdx >= 0)
+    {
+      if (out >= maxLen)
+      {
+        return -1;
+      }
+      tokens[out++] = keywords[kwIdx].token;
+      pos += strlen(keywords[kwIdx].text);
+      continue;
+    }
+
+    // Variable name (starts with letter)
+    if (isalpha(src[pos]))
+    {
+      int start = pos;
+      while (isalnum(src[pos]) || src[pos] == '_')
+      {
+        pos++;
+      }
+      bool isString = (src[pos] == '$');
+      if (isString)
+      {
+        pos++;
+      }
+      int vlen = pos - start;
+      if (out + 2 + vlen >= maxLen)
+      {
+        return -1;
+      }
+      tokens[out++] = isString ? TOK_VAR_STRING : TOK_VARIABLE;
+      tokens[out++] = (uint8_t)vlen;
+      // Store variable name in uppercase
+      for (int i = 0; i < vlen; i++)
+      {
+        tokens[out++] = toupper(src[start + i]);
+      }
+      continue;
+    }
+
+    // Unknown character — skip it
+    pos++;
+  }
+
+  // End of line marker
+  if (out >= maxLen)
+  {
+    return -1;
+  }
+  tokens[out++] = TOK_EOL;
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Detokenizer — convert tokens back to text
+// ---------------------------------------------------------------------------
+
+static int detokenizeLine(const uint8_t* tokens, int length, char* buf,
+                          int bufSize)
+{
+  int pos = 0;
+  int out = 0;
+
+  while (pos < length && tokens[pos] != TOK_EOL)
+  {
+    uint8_t tok = tokens[pos++];
+
+    // Keywords
+    if (tok >= 0x80 && tok <= 0xCF)
+    {
+      // Find keyword text
+      for (int i = 0; keywords[i].text != NULL; i++)
+      {
+        if (keywords[i].token == tok)
+        {
+          int klen = strlen(keywords[i].text);
+          if (out + klen + 1 >= bufSize)
+          {
+            break;
+          }
+          if (out > 0 && buf[out - 1] != ' ')
+          {
+            buf[out++] = ' ';
+          }
+          memcpy(&buf[out], keywords[i].text, klen);
+          out += klen;
+          buf[out++] = ' ';
+          break;
+        }
+      }
+      continue;
+    }
+
+    // Operators
+    if (tok >= TOK_PLUS && tok <= TOK_CONCAT)
+    {
+      const char* ops[] = {"+", "-", "*", "/", "^", "=", "<>",
+                           "<", ">", "<=", ">=", "AND", "OR",
+                           "NOT", "&"};
+      int idx = tok - TOK_PLUS;
+      const char* op = ops[idx];
+      int olen = strlen(op);
+      if (out + olen >= bufSize)
+      {
+        break;
+      }
+      memcpy(&buf[out], op, olen);
+      out += olen;
+      continue;
+    }
+
+    // String literal
+    if (tok == TOK_STRING_LIT)
+    {
+      uint8_t slen = tokens[pos++];
+      if (out + slen + 2 >= bufSize)
+      {
+        break;
+      }
+      buf[out++] = '"';
+      memcpy(&buf[out], &tokens[pos], slen);
+      out += slen;
+      pos += slen;
+      buf[out++] = '"';
+      continue;
+    }
+
+    // Number literal
+    if (tok == TOK_NUMBER_LIT)
+    {
+      float val;
+      memcpy(&val, &tokens[pos], 4);
+      pos += 4;
+      out += snprintf(&buf[out], bufSize - out, "%g", val);
+      continue;
+    }
+
+    // Variable name
+    if (tok == TOK_VARIABLE || tok == TOK_VAR_STRING)
+    {
+      uint8_t vlen = tokens[pos++];
+      if (out + vlen >= bufSize)
+      {
+        break;
+      }
+      memcpy(&buf[out], &tokens[pos], vlen);
+      out += vlen;
+      pos += vlen;
+      continue;
+    }
+
+    // Punctuation
+    if (tok >= TOK_LPAREN && tok <= TOK_COLON)
+    {
+      const char puncts[] = {'(', ')', ',', ';', ':'};
+      int idx = tok - TOK_LPAREN;
+      if (out < bufSize - 1)
+      {
+        buf[out++] = puncts[idx];
+      }
+      continue;
+    }
+  }
+
+  buf[out] = '\0';
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Program management
+// ---------------------------------------------------------------------------
+
+// Find index where lineNum is or should be inserted (binary search)
+static int findLineIndex(uint16_t lineNum)
+{
+  int lo = 0, hi = programSize - 1;
+  while (lo <= hi)
+  {
+    int mid = (lo + hi) / 2;
+    if (program[mid]->lineNum == lineNum)
+    {
+      return mid;
+    }
+    if (program[mid]->lineNum < lineNum)
+    {
+      lo = mid + 1;
+    }
+    else
+    {
+      hi = mid - 1;
+    }
+  }
+  return lo;  // insertion point
+}
+
+// Insert or replace a program line
+static bool storeLine(uint16_t lineNum, const uint8_t* tokens, int length)
+{
+  int idx = findLineIndex(lineNum);
+
+  // Replace existing line
+  if (idx < programSize && program[idx]->lineNum == lineNum)
+  {
+    memcpy(program[idx]->tokens, tokens, length);
+    program[idx]->length = length;
+    return true;
+  }
+
+  // Insert new line
+  if (programSize >= MAX_LINES)
+  {
+    return false;
+  }
+
+  ProgramLine* line = (ProgramLine*)malloc(sizeof(ProgramLine));
+  if (line == NULL)
+  {
+    return false;
+  }
+
+  line->lineNum = lineNum;
+  memcpy(line->tokens, tokens, length);
+  line->length = length;
+
+  // Shift lines up to make room
+  for (int i = programSize; i > idx; i--)
+  {
+    program[i] = program[i - 1];
+  }
+  program[idx] = line;
+  programSize++;
+  return true;
+}
+
+// Delete a program line
+static bool deleteLine(uint16_t lineNum)
+{
+  int idx = findLineIndex(lineNum);
+  if (idx >= programSize || program[idx]->lineNum != lineNum)
+  {
+    return false;
+  }
+
+  free(program[idx]);
+
+  for (int i = idx; i < programSize - 1; i++)
+  {
+    program[i] = program[i + 1];
+  }
+  programSize--;
+  return true;
+}
+
+// Clear entire program
+static void clearProgram()
+{
+  for (int i = 0; i < programSize; i++)
+  {
+    free(program[i]);
+    program[i] = NULL;
+  }
+  programSize = 0;
+}
+
+// ---------------------------------------------------------------------------
+// Display driver
+// ---------------------------------------------------------------------------
+
+SPIClass lcd_spi(FSPI);
+Adafruit_ST7789 tft(&lcd_spi, LCD_CS, LCD_DC, LCD_RST);
+
+static int cursorCol = 0;
+static int cursorRow = 0;
+
+// TI Extended BASIC colors (black text on cyan background)
+static uint16_t fgColor = 0x0000;  // black
+static uint16_t bgColor = 0x07FF;  // cyan
+
+// Display framebuffer — 30x24 characters
+static char screenBuf[ROWS][COLS];
+
+static void initDisplay()
+{
+  pinMode(LCD_BL, OUTPUT);
+  digitalWrite(LCD_BL, HIGH);
+
+  lcd_spi.begin(LCD_SCLK, -1, LCD_MOSI, LCD_CS);
+  tft.init(240, 240, SPI_MODE0);
+  tft.setRotation(2);
+  tft.fillScreen(bgColor);
+  tft.setTextSize(1);
+  tft.setTextColor(fgColor, bgColor);
+}
+
+// Previous screen state for dirty-cell tracking
+static char prevScreenBuf[ROWS][COLS];
+
+// Draw a single character cell using a pre-built row buffer for speed
+static void drawCell(int col, int row)
+{
+  uint8_t ch = (uint8_t)screenBuf[row][col];
+  int px = col * CHAR_W + DISPLAY_X_OFFSET;
+  int py = row * CHAR_H + DISPLAY_Y_OFFSET;
+
+  // Build a pixel buffer for the entire 8x8 cell
+  uint16_t pixBuf[64];
+  for (int y = 0; y < 8; y++)
+  {
+    uint8_t bits = charPatterns[ch][y];
+    for (int x = 0; x < 8; x++)
+    {
+      pixBuf[y * 8 + x] = (bits & 0x80) ? fgColor : bgColor;
+      bits <<= 1;
+    }
+  }
+
+  // Push entire cell in one SPI transaction
+  tft.drawRGBBitmap(px, py, pixBuf, 8, 8);
+}
+
+// Redraw only cells that changed
+static void refreshScreen()
+{
+  for (int r = 0; r < ROWS; r++)
+  {
+    for (int c = 0; c < COLS; c++)
+    {
+      if (screenBuf[r][c] != prevScreenBuf[r][c])
+      {
+        drawCell(c, r);
+        prevScreenBuf[r][c] = screenBuf[r][c];
+      }
+    }
+  }
+}
+
+// Redraw entire screen (force all cells)
+static void redrawScreen()
+{
+  for (int r = 0; r < ROWS; r++)
+  {
+    for (int c = 0; c < COLS; c++)
+    {
+      drawCell(c, r);
+      prevScreenBuf[r][c] = screenBuf[r][c];
+    }
+  }
+}
+
+static void scrollUp()
+{
+  // Shift entire framebuffer up one row in a single copy
+  memcpy(&screenBuf[0][0], &screenBuf[1][0], COLS * (ROWS - 1));
+  memset(&screenBuf[ROWS - 1][0], 0x20, COLS);
+  // Redraw changed cells
+  refreshScreen();
+  // Force clear bottom row on display (in case dirty tracking missed it)
+  int y = (ROWS - 1) * CHAR_H + DISPLAY_Y_OFFSET;
+  tft.fillRect(DISPLAY_X_OFFSET, y, COLS * CHAR_W, CHAR_H, bgColor);
+}
+
+static void printChar(char c)
+{
+  if (c == '\n')
+  {
+    cursorCol = 0;
+    cursorRow++;
+    if (cursorRow >= ROWS)
+    {
+      scrollUp();
+      cursorRow = ROWS - 1;
+    }
+    return;
+  }
+
+  if (cursorCol >= COLS)
+  {
+    cursorCol = 0;
+    cursorRow++;
+    if (cursorRow >= ROWS)
+    {
+      scrollUp();
+      cursorRow = ROWS - 1;
+    }
+  }
+
+  screenBuf[cursorRow][cursorCol] = c;
+  drawCell(cursorCol, cursorRow);
+  cursorCol++;
+}
+
+static void printString(const char* str)
+{
+  while (*str)
+  {
+    printChar(*str++);
+  }
+}
+
+static void printLine(const char* str)
+{
+  printString(str);
+  printChar('\n');
+}
+
+static void clearScreen()
+{
+  for (int r = 0; r < ROWS; r++)
+  {
+    memset(screenBuf[r], ' ', COLS);
+  }
+  tft.fillScreen(bgColor);
+  cursorCol = 0;
+  cursorRow = 0;
+}
+
+static void showStatus(const char* msg)
+{
+  tft.fillRect(0, STATUS_Y, SCREEN_W, SCREEN_H - STATUS_Y, 0x18E3);
+  tft.setTextColor(0xFFFF, 0x18E3);
+  tft.setCursor(2, STATUS_Y + 2);
+  tft.print(msg);
+  tft.setTextColor(fgColor, bgColor);
+}
+
+// ---------------------------------------------------------------------------
+// Input handling (serial for now, USB keyboard later)
+// ---------------------------------------------------------------------------
+
+static char inputBuf[MAX_INPUT_LEN + 1];
+static int inputPos = 0;
+static bool inputReady = false;
+
+static void checkInput()
+{
+  while (Serial.available())
+  {
+    char c = Serial.read();
+
+    if (c == '\r' || c == '\n')
+    {
+      inputBuf[inputPos] = '\0';
+      inputReady = true;
+      printChar('\n');
+      return;
+    }
+
+    if (c == '\b' || c == 127)
+    {
+      if (inputPos > 0)
+      {
+        inputPos--;
+        // Erase character on display
+        cursorCol--;
+        tft.fillRect(cursorCol * CHAR_W, cursorRow * CHAR_H,
+                     CHAR_W, CHAR_H, bgColor);
+      }
+      return;
+    }
+
+    if (inputPos < MAX_INPUT_LEN && c >= 32 && c < 127)
+    {
+      inputBuf[inputPos++] = c;
+      printChar(c);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// RUN engine
+// ---------------------------------------------------------------------------
+
+static bool running = false;
+static int currentLine = 0;     // index into program[] array
+
+// Read a float from token stream
+static float readNumber(const uint8_t* tokens, int* pos)
+{
+  float val;
+  memcpy(&val, &tokens[*pos], 4);
+  *pos += 4;
+  return val;
+}
+
+// Read a string literal from token stream, returns pointer and length
+static const char* readString(const uint8_t* tokens, int* pos, int* len)
+{
+  *len = tokens[*pos];
+  (*pos)++;
+  const char* str = (const char*)&tokens[*pos];
+  *pos += *len;
+  return str;
+}
+
+// Execute a PRINT statement starting at token position pos
+static void execPrint(const uint8_t* tokens, int* pos)
+{
+  bool needNewline = true;
+
+  while (tokens[*pos] != TOK_EOL && tokens[*pos] != TOK_COLON)
+  {
+    uint8_t tok = tokens[*pos];
+
+    if (tok == TOK_STRING_LIT)
+    {
+      (*pos)++;
+      int len;
+      const char* str = readString(tokens, pos, &len);
+      for (int i = 0; i < len; i++)
+      {
+        printChar(str[i]);
+      }
+      needNewline = true;
+    }
+    else if (tok == TOK_SEMICOLON)
+    {
+      (*pos)++;
+      needNewline = false;
+    }
+    else if (tok == TOK_COMMA)
+    {
+      (*pos)++;
+      // Tab to next column (TI used 14-column tab stops)
+      int nextTab = ((cursorCol / 14) + 1) * 14;
+      while (cursorCol < nextTab && cursorCol < COLS)
+      {
+        printChar(' ');
+      }
+      needNewline = false;
+    }
+    else if (tok == TOK_NUMBER_LIT || tok == TOK_VARIABLE ||
+             tok == TOK_VAR_STRING || tok == TOK_LPAREN ||
+             tok == TOK_MINUS)
+    {
+      // Evaluate numeric expression
+      float val = evalExpression(tokens, pos);
+      char buf[20];
+      // TI BASIC: positive numbers have leading space
+      if (val >= 0)
+      {
+        snprintf(buf, sizeof(buf), " %g", val);
+      }
+      else
+      {
+        snprintf(buf, sizeof(buf), "%g", val);
+      }
+      printString(buf);
+      needNewline = true;
+    }
+    else
+    {
+      // Skip unknown tokens
+      (*pos)++;
+      needNewline = true;
+    }
+  }
+
+  if (needNewline)
+  {
+    printChar('\n');
+  }
+}
+
+// Execute a GOTO — find target line number
+static int execGoto(const uint8_t* tokens, int* pos)
+{
+  if (tokens[*pos] == TOK_NUMBER_LIT)
+  {
+    (*pos)++;
+    float val = readNumber(tokens, pos);
+    uint16_t targetLine = (uint16_t)val;
+
+    int idx = findLineIndex(targetLine);
+    if (idx < programSize && program[idx]->lineNum == targetLine)
+    {
+      return idx;
+    }
+    else
+    {
+      printLine("* BAD LINE NUMBER");
+      running = false;
+      return -1;
+    }
+  }
+
+  printLine("* SYNTAX ERROR");
+  running = false;
+  return -1;
+}
+
+// Execute one program line. Returns next line index, or -1 to stop.
+static int executeLine(int lineIdx)
+{
+  ProgramLine* line = program[lineIdx];
+  int pos = 0;
+  int nextLine = lineIdx + 1;
+
+  while (pos < line->length && line->tokens[pos] != TOK_EOL)
+  {
+    uint8_t tok = line->tokens[pos];
+
+    switch (tok)
+    {
+      case TOK_PRINT:
+        pos++;
+        execPrint(line->tokens, &pos);
+        break;
+
+      case TOK_LET:
+        pos++;  // skip LET keyword, fall through to assignment
+        // fall through
+
+      case TOK_VARIABLE:
+      case TOK_VAR_STRING:
+      {
+        // Assignment: VAR = expression
+        bool isStr = (line->tokens[pos] == TOK_VAR_STRING);
+        pos++;
+        int vlen = line->tokens[pos];
+        pos++;
+        const char* vname = (const char*)&line->tokens[pos];
+        pos += vlen;
+
+        if (line->tokens[pos] == TOK_EQUAL)
+        {
+          pos++;
+          Variable* v = findVar(vname, vlen, isStr);
+          if (v)
+          {
+            v->numVal = evalExpression(line->tokens, &pos);
+            Serial.printf("DEBUG: %s = %g\n", v->name, v->numVal);
+          }
+          else
+          {
+            Serial.println("DEBUG: findVar returned NULL");
+          }
+        }
+        else
+        {
+          Serial.printf("DEBUG: expected = but got token 0x%02X\n",
+                        line->tokens[pos]);
+        }
+        break;
+      }
+
+      case TOK_IF:
+      {
+        pos++;
+        bool cond = evalCondition(line->tokens, &pos);
+        if (line->tokens[pos] == TOK_THEN)
+        {
+          pos++;
+        }
+        if (cond)
+        {
+          // If next token is a line number, GOTO it
+          if (line->tokens[pos] == TOK_NUMBER_LIT)
+          {
+            int target = execGoto(line->tokens, &pos);
+            if (target >= 0)
+            {
+              return target;
+            }
+            return -1;
+          }
+          // Otherwise continue executing rest of line
+        }
+        else
+        {
+          // Skip to ELSE or end of line
+          while (pos < line->length &&
+                 line->tokens[pos] != TOK_ELSE &&
+                 line->tokens[pos] != TOK_EOL)
+          {
+            pos++;
+          }
+          if (line->tokens[pos] == TOK_ELSE)
+          {
+            pos++;
+          }
+          else
+          {
+            return nextLine;
+          }
+        }
+        break;
+      }
+
+      case TOK_FOR:
+      {
+        // FOR var = start TO end [STEP step]
+        pos++;
+        if (line->tokens[pos] == TOK_VARIABLE)
+        {
+          pos++;
+          int vlen = line->tokens[pos];
+          pos++;
+          const char* vname = (const char*)&line->tokens[pos];
+          pos += vlen;
+
+          Variable* v = findVar(vname, vlen, false);
+
+          float startVal = 0, limitVal = 0, stepVal = 1;
+
+          if (line->tokens[pos] == TOK_EQUAL)
+          {
+            pos++;
+            startVal = evalExpression(line->tokens, &pos);
+          }
+          if (line->tokens[pos] == TOK_TO)
+          {
+            pos++;
+            limitVal = evalExpression(line->tokens, &pos);
+          }
+          if (line->tokens[pos] == TOK_STEP)
+          {
+            pos++;
+            stepVal = evalExpression(line->tokens, &pos);
+          }
+
+          if (v)
+          {
+            v->numVal = startVal;
+          }
+
+          // Push loop frame
+          if (forDepth < MAX_FOR_DEPTH)
+          {
+            ForFrame* f = &forStack[forDepth++];
+            int copyLen = (vlen < MAX_VAR_NAME - 1) ? vlen : MAX_VAR_NAME - 1;
+            memcpy(f->varName, vname, copyLen);
+            f->varName[copyLen] = '\0';
+            f->limit = limitVal;
+            f->step = stepVal;
+            f->lineIdx = lineIdx;
+          }
+        }
+        break;
+      }
+
+      case TOK_NEXT:
+      {
+        pos++;
+        // Skip optional variable name after NEXT
+        if (line->tokens[pos] == TOK_VARIABLE)
+        {
+          pos++;
+          int vlen = line->tokens[pos];
+          pos++;
+          pos += vlen;
+        }
+
+        if (forDepth <= 0)
+        {
+          printLine("* NEXT WITHOUT FOR");
+          running = false;
+          return -1;
+        }
+
+        ForFrame* f = &forStack[forDepth - 1];
+        Variable* v = findVar(f->varName, strlen(f->varName), false);
+        if (v)
+        {
+          v->numVal += f->step;
+
+          bool done = (f->step > 0) ? (v->numVal > f->limit)
+                                    : (v->numVal < f->limit);
+          if (!done)
+          {
+            // Loop back to the line AFTER the FOR
+            return f->lineIdx + 1;
+          }
+        }
+
+        // Loop finished — pop the frame
+        forDepth--;
+        break;
+      }
+
+      case TOK_GOTO:
+      {
+        pos++;
+        int target = execGoto(line->tokens, &pos);
+        if (target >= 0)
+        {
+          return target;
+        }
+        return -1;
+      }
+
+      case TOK_END:
+      case TOK_STOP:
+        running = false;
+        return -1;
+
+      case TOK_CALL:
+      {
+        pos++;
+        // Read subroutine name
+        if (line->tokens[pos] == TOK_VARIABLE)
+        {
+          pos++;
+          int vlen = line->tokens[pos];
+          pos++;
+          char subName[32];
+          int copyLen = (vlen < 31) ? vlen : 31;
+          memcpy(subName, &line->tokens[pos], copyLen);
+          subName[copyLen] = '\0';
+          pos += vlen;
+
+          if (strcasecmp(subName, "CLEAR") == 0)
+          {
+            clearScreen();
+          }
+          else
+          {
+            char buf[40];
+            snprintf(buf, sizeof(buf), "* BAD NAME: %s", subName);
+            printLine(buf);
+            running = false;
+            return -1;
+          }
+        }
+        break;
+      }
+
+      case TOK_REM:
+        // Skip rest of line
+        return nextLine;
+
+      case TOK_COLON:
+        // Statement separator — continue to next statement
+        pos++;
+        break;
+
+      default:
+        // Skip unknown tokens for now
+        Serial.printf("DEBUG: unknown token 0x%02X at pos %d\n", tok, pos);
+        pos++;
+        break;
+    }
+  }
+
+  return nextLine;
+}
+
+// Run the program
+static void runProgram()
+{
+  if (programSize == 0)
+  {
+    printLine("* NO PROGRAM");
+    return;
+  }
+
+  clearVars();
+  clearForStack();
+  running = true;
+  currentLine = 0;
+
+  while (running && currentLine >= 0 && currentLine < programSize)
+  {
+    int next = executeLine(currentLine);
+    currentLine = next;
+
+    // Check for serial input to break (any key stops)
+    if (Serial.available())
+    {
+      Serial.read();
+      printLine("");
+      printLine("* BREAKPOINT");
+      char buf[40];
+      snprintf(buf, sizeof(buf), "  AT LINE %d", program[currentLine >= 0 ? currentLine : programSize - 1]->lineNum);
+      printLine(buf);
+      running = false;
+    }
+
+    // Small yield to prevent watchdog timeout on tight loops
+    yield();
+  }
+
+  if (!running || currentLine >= programSize)
+  {
+    printLine("");
+    printLine("** DONE **");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Command/line processor
+// ---------------------------------------------------------------------------
+
+static void processInput(const char* input)
+{
+  // Skip leading spaces
+  int pos = 0;
+  while (input[pos] == ' ')
+  {
+    pos++;
+  }
+
+  if (input[pos] == '\0')
+  {
+    return;
+  }
+
+  // DIR command (not a TI keyword — simulator extension)
+  if (strncasecmp(&input[pos], "DIR", 3) == 0 &&
+      (input[pos + 3] == '\0' || input[pos + 3] == ' '))
+  {
+    File root = LittleFS.open("/");
+    File f = root.openNextFile();
+    if (!f)
+    {
+      printLine("  (no files)");
+    }
+    while (f)
+    {
+      char buf[48];
+      snprintf(buf, sizeof(buf), "  %-20s %d", f.name(), f.size());
+      printLine(buf);
+      f = root.openNextFile();
+    }
+    return;
+  }
+
+  // Check if line starts with a number (program line)
+  if (isdigit(input[pos]))
+  {
+    char* endp;
+    uint16_t lineNum = (uint16_t)strtol(&input[pos], &endp, 10);
+    pos = endp - input;
+
+    // Skip spaces after line number
+    while (input[pos] == ' ')
+    {
+      pos++;
+    }
+
+    // Just a line number with nothing after — delete the line
+    if (input[pos] == '\0')
+    {
+      if (deleteLine(lineNum))
+      {
+        Serial.printf("Deleted line %d\n", lineNum);
+      }
+      return;
+    }
+
+    // Tokenize and store
+    uint8_t tokens[MAX_LINE_TOKENS];
+    int len = tokenizeLine(&input[pos], tokens, MAX_LINE_TOKENS);
+    if (len < 0)
+    {
+      printLine("* LINE TOO LONG");
+      return;
+    }
+
+    if (!storeLine(lineNum, tokens, len))
+    {
+      printLine("* MEMORY FULL");
+      return;
+    }
+
+    char status[40];
+    snprintf(status, sizeof(status), "Lines: %d  Free: %dK",
+             programSize, (int)(ESP.getFreeHeap() / 1024));
+    showStatus(status);
+    return;
+  }
+
+  // Immediate mode — tokenize and check for commands
+  uint8_t tokens[MAX_LINE_TOKENS];
+  int len = tokenizeLine(&input[pos], tokens, MAX_LINE_TOKENS);
+  if (len < 0)
+  {
+    printLine("* SYNTAX ERROR");
+    return;
+  }
+
+  // Check first token for immediate commands
+  switch (tokens[0])
+  {
+    case TOK_NEW:
+      clearProgram();
+      clearScreen();
+      printLine("** READY **");
+      showStatus("NEW program");
+      break;
+
+    case TOK_LIST:
+    {
+      char buf[256];
+      for (int i = 0; i < programSize; i++)
+      {
+        int n = snprintf(buf, sizeof(buf), "%d ", program[i]->lineNum);
+        detokenizeLine(program[i]->tokens, program[i]->length,
+                       &buf[n], sizeof(buf) - n);
+        printLine(buf);
+      }
+      break;
+    }
+
+    case TOK_RUN:
+      runProgram();
+      break;
+
+    case TOK_SAVE:
+    {
+      // Get filename from tokens — expect a string literal or variable name
+      int tp = 1;
+      char filename[32] = "PROGRAM";
+
+      if (tokens[tp] == TOK_STRING_LIT)
+      {
+        tp++;
+        int slen = tokens[tp++];
+        int copyLen = (slen < 31) ? slen : 31;
+        memcpy(filename, &tokens[tp], copyLen);
+        filename[copyLen] = '\0';
+      }
+      else if (tokens[tp] == TOK_VARIABLE)
+      {
+        tp++;
+        int vlen = tokens[tp++];
+        int copyLen = (vlen < 31) ? vlen : 31;
+        memcpy(filename, &tokens[tp], copyLen);
+        filename[copyLen] = '\0';
+      }
+
+      // Build path
+      char path[48];
+      snprintf(path, sizeof(path), "/%s.bas", filename);
+
+      File f = LittleFS.open(path, "w");
+      if (!f)
+      {
+        printLine("* FILE ERROR");
+        break;
+      }
+
+      char buf[256];
+      for (int i = 0; i < programSize; i++)
+      {
+        int n = snprintf(buf, sizeof(buf), "%d ", program[i]->lineNum);
+        detokenizeLine(program[i]->tokens, program[i]->length,
+                       &buf[n], sizeof(buf) - n);
+        f.println(buf);
+      }
+      f.close();
+
+      char msg[48];
+      snprintf(msg, sizeof(msg), "SAVED: %s", path);
+      printLine(msg);
+      break;
+    }
+
+    case TOK_OLD:
+    {
+      // Get filename
+      int tp = 1;
+      char filename[32] = "PROGRAM";
+
+      if (tokens[tp] == TOK_STRING_LIT)
+      {
+        tp++;
+        int slen = tokens[tp++];
+        int copyLen = (slen < 31) ? slen : 31;
+        memcpy(filename, &tokens[tp], copyLen);
+        filename[copyLen] = '\0';
+      }
+      else if (tokens[tp] == TOK_VARIABLE)
+      {
+        tp++;
+        int vlen = tokens[tp++];
+        int copyLen = (vlen < 31) ? vlen : 31;
+        memcpy(filename, &tokens[tp], copyLen);
+        filename[copyLen] = '\0';
+      }
+
+      char path[48];
+      snprintf(path, sizeof(path), "/%s.bas", filename);
+
+      File f = LittleFS.open(path, "r");
+      if (!f)
+      {
+        printLine("* FILE NOT FOUND");
+        break;
+      }
+
+      clearProgram();
+
+      while (f.available())
+      {
+        String line = f.readStringUntil('\n');
+        line.trim();
+        if (line.length() > 0)
+        {
+          processInput(line.c_str());
+        }
+      }
+      f.close();
+
+      char msg[48];
+      snprintf(msg, sizeof(msg), "LOADED: %s", path);
+      printLine(msg);
+      break;
+    }
+
+    case TOK_BYE:
+      clearScreen();
+      printLine("** GOODBYE **");
+      break;
+
+    default:
+      printLine("* NOT IMPLEMENTED");
+      break;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Setup and main loop
+// ---------------------------------------------------------------------------
+
+void setup()
+{
+  Serial.begin(115200);
+  delay(500);
+
+  pinMode(LED_GREEN, OUTPUT);
+  pinMode(LED_YELLOW, OUTPUT);
+  digitalWrite(LED_GREEN, HIGH);
+
+  // Initialize LittleFS
+  if (!LittleFS.begin(true))
+  {
+    Serial.println("LittleFS mount failed!");
+  }
+  else
+  {
+    Serial.println("LittleFS mounted.");
+  }
+
+  initDisplay();
+
+  // Initialize TI character patterns (copies ROM defaults to RAM)
+  initCharPatterns();
+
+  // Initialize framebuffer and previous state
+  for (int r = 0; r < ROWS; r++)
+  {
+    memset(screenBuf[r], ' ', COLS);
+    memset(prevScreenBuf[r], 0, COLS);  // Force initial full draw
+  }
+
+  clearScreen();
+  printLine("TI EXTENDED BASIC");
+  printLine("SIMULATOR v0.1");
+  printLine("");
+  printLine("READY");
+  printString(">");
+
+  char statusBuf[40];
+  snprintf(statusBuf, sizeof(statusBuf), "TI BASIC Sim | Free: %dK",
+           (int)(ESP.getFreeHeap() / 1024));
+  showStatus(statusBuf);
+
+  Serial.println("TI Extended BASIC Simulator v0.1");
+  Serial.println("Type BASIC commands. Serial input active.");
+}
+
+void loop()
+{
+  checkInput();
+
+  if (inputReady)
+  {
+    processInput(inputBuf);
+    printString(">");
+    inputPos = 0;
+    inputReady = false;
+  }
+}
