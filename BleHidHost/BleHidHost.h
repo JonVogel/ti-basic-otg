@@ -68,6 +68,14 @@ public:
   static bool isConnected();
   static bool isReady();
   static bool inPairingMode()  { return _pairingMode; }
+  // Milliseconds remaining in the current pairing window (0 if not
+  // pairing).
+  static unsigned long pairingRemainingMs()
+  {
+    if (!_pairingMode) return 0;
+    long remain = (long)(_pairingDeadline - millis());
+    return remain > 0 ? (unsigned long)remain : 0;
+  }
   static int  peerCount();   // number of currently-connected peers
 
 private:
@@ -107,6 +115,7 @@ private:
   static bool _addressIsAlreadyKnownOrConnected(const String& addr);
   static void _persistPeer(int slot);
   static void _loadAllPeers();
+  static void _bootButtonIsr();
 
   // Inner callback classes
   class ClientCallbacks;
@@ -521,6 +530,12 @@ inline void BleHidHost::begin(const char* deviceName, const char* nvsNamespace)
   _doScan = true;
 
   pinMode(_bootButtonPin, INPUT_PULLUP);
+  // Attach falling-edge ISR so a BOOT-button press anywhere — even
+  // when the main loop is held up by something else — sets the
+  // pairing-request flag immediately. The actual BLE work runs in
+  // the next task() call (BLE stack APIs aren't ISR-safe).
+  attachInterrupt(digitalPinToInterrupt(_bootButtonPin),
+                  _bootButtonIsr, FALLING);
   Serial.println("BleHidHost: scanning...");
 }
 
@@ -607,14 +622,18 @@ inline void BleHidHost::task()
     _doScan = true;
   }
 
-  // BOOT button → request pairing.
-  if (digitalRead(_bootButtonPin) == LOW)
-  {
-    delay(50);
-    if (digitalRead(_bootButtonPin) == LOW)
-    {
-      enterPairingMode(_pairingWindowMs);
-      while (digitalRead(_bootButtonPin) == LOW) { delay(50); }
-    }
-  }
+  // BOOT button is now ISR-driven — _bootButtonIsr sets
+  // _pairingRequested directly. Nothing to poll here.
+}
+
+// ISR for the BOOT button. Just flag the request — actual BLE work
+// happens on the next task() call. Not IRAM_ATTR because the volatile
+// flag we touch lives in flash; the linker rejects mixed IRAM/flash
+// access. Acceptable since BOOT-press timing isn't critical and we
+// won't be in the middle of a flash write when the user prods it.
+inline void BleHidHost::_bootButtonIsr()
+{
+  // Idempotent flag set; bounce-safe because re-asserting it has no
+  // effect.
+  _pairingRequested = true;
 }

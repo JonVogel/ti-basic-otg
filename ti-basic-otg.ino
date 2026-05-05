@@ -956,11 +956,51 @@ static void showBootScreen()
 
   // Wait for any key — from Serial or BLE keyboard. Keep BLE scanning
   // alive so reconnect can complete while we're sitting here.
-  while (!Serial.available() && !bleKbAvailable())
+  // Wait for any key — from Serial or BLE keyboard. Keep BLE scanning
+  // alive so reconnect can complete while we're sitting here. Also
+  // handle the BLE-pairing takeover so a BOOT-button press here
+  // brings up the pairing UI immediately and restores the title
+  // screen when the pairing window closes.
   {
-    bleKbTask();
-    yield();
-    delay(10);
+    bool prevPair = false;
+    bool wasInBootUI = true;
+    unsigned long lastCount = 0;
+    while (!Serial.available() && !bleKbAvailable())
+    {
+      bleKbTask();
+      bool nowPair = BleHidHost::inPairingMode();
+      if (nowPair != prevPair)
+      {
+        if (nowPair)
+        {
+          drawPairingScreen();
+          wasInBootUI = false;
+        }
+        else if (!wasInBootUI)
+        {
+          // Pairing window closed — redraw the boot UI we hid.
+          fillBackground(tiPalette[8]);
+          showBootScreen();
+          // showBootScreen has its own wait loops, so we'd recurse;
+          // bail out of THIS wait instead and let the recursion
+          // handle further input.
+          return;
+        }
+        prevPair = nowPair;
+        lastCount = 0;
+      }
+      if (nowPair)
+      {
+        unsigned long now = millis();
+        if (now - lastCount >= 500)
+        {
+          updatePairingCountdown(BleHidHost::pairingRemainingMs());
+          lastCount = now;
+        }
+      }
+      yield();
+      delay(10);
+    }
   }
   while (Serial.available()) { Serial.read(); delay(2); }
   while (bleKbAvailable())   { bleKbRead();  delay(2); }
@@ -990,11 +1030,51 @@ static void showBootScreen()
 
   Serial.println("PRESS 1 OR 2 TO CONTINUE");
 
-  while (!Serial.available() && !bleKbAvailable())
+  // Wait for any key — from Serial or BLE keyboard. Keep BLE scanning
+  // alive so reconnect can complete while we're sitting here. Also
+  // handle the BLE-pairing takeover so a BOOT-button press here
+  // brings up the pairing UI immediately and restores the title
+  // screen when the pairing window closes.
   {
-    bleKbTask();
-    yield();
-    delay(10);
+    bool prevPair = false;
+    bool wasInBootUI = true;
+    unsigned long lastCount = 0;
+    while (!Serial.available() && !bleKbAvailable())
+    {
+      bleKbTask();
+      bool nowPair = BleHidHost::inPairingMode();
+      if (nowPair != prevPair)
+      {
+        if (nowPair)
+        {
+          drawPairingScreen();
+          wasInBootUI = false;
+        }
+        else if (!wasInBootUI)
+        {
+          // Pairing window closed — redraw the boot UI we hid.
+          fillBackground(tiPalette[8]);
+          showBootScreen();
+          // showBootScreen has its own wait loops, so we'd recurse;
+          // bail out of THIS wait instead and let the recursion
+          // handle further input.
+          return;
+        }
+        prevPair = nowPair;
+        lastCount = 0;
+      }
+      if (nowPair)
+      {
+        unsigned long now = millis();
+        if (now - lastCount >= 500)
+        {
+          updatePairingCountdown(BleHidHost::pairingRemainingMs());
+          lastCount = now;
+        }
+      }
+      yield();
+      delay(10);
+    }
   }
   while (Serial.available()) { Serial.read(); delay(2); }
   while (bleKbAvailable())   { bleKbRead();  delay(2); }
@@ -1008,6 +1088,51 @@ static void showStatus(const char* msg)
   tft.setTextColor(0xFFFF, 0x18E3);
   tft.setCursor(2, STATUS_Y + 2);
   tft.print(msg);
+  tft.setTextColor(fgColor, bgColor);
+}
+
+// Full-screen takeover while BLE pairing is active. The user
+// triggered pairing (BOOT button or watchdog), so they're not using
+// BASIC right now — we use the whole panel to clearly explain
+// what's happening and show a live countdown.
+static void drawPairingScreen()
+{
+  // Dark blue background, white text.
+  tft.fillScreen(0x0012);
+  tft.setTextColor(0xFFFF, 0x0012);
+
+  tft.setTextSize(2);
+  tft.setCursor(36, 30);
+  tft.print("BLE PAIRING");
+
+  tft.setTextSize(1);
+  tft.setCursor(20, 70);
+  tft.print("Press the PAIR button");
+  tft.setCursor(20, 82);
+  tft.print("on your keyboard now.");
+
+  tft.setCursor(20, 110);
+  tft.print("Watching for advertisers");
+  tft.setCursor(20, 122);
+  tft.print("with a HID profile...");
+
+  tft.setCursor(20, 200);
+  tft.setTextColor(0xC618, 0x0012);   // light gray
+  tft.print("(Window expires in:        s)");
+  tft.setTextColor(0xFFFF, 0x0012);
+}
+
+// Update only the dynamic countdown each tick. Avoids a full
+// redraw every second.
+static void updatePairingCountdown(unsigned long remainMs)
+{
+  // Clear just the digits area.
+  tft.fillRect(170, 200, 30, 10, 0x0012);
+  tft.setTextSize(1);
+  tft.setTextColor(0xFFFF, 0x0012);
+  tft.setCursor(170, 200);
+  unsigned long s = (remainMs + 999) / 1000;
+  tft.print(s);
   tft.setTextColor(fgColor, bgColor);
 }
 
@@ -2220,15 +2345,37 @@ void loop()
   bleKbTask();
   checkInput();
 
-  // Status-bar overlay for BLE pairing state. Edge-triggered so we
-  // only redraw on entry/exit, not every loop iteration.
+  // Full-screen takeover while BLE pairing is open. User triggered
+  // pairing (BOOT button / F12 / watchdog) so they're not using
+  // BASIC; we use the whole panel for a clear "PAIRING — press the
+  // pair button" UI with a live countdown. On exit, restore the
+  // BASIC display from screenBuf.
   static bool prevPairingMode = false;
+  static unsigned long lastCountdown = 0;
   bool nowPairing = BleHidHost::inPairingMode();
   if (nowPairing != prevPairingMode)
   {
-    if (nowPairing) showStatus("** BLE PAIRING - PUT KEYBOARD IN PAIR MODE **");
-    else            showStatus("");
+    if (nowPairing)
+    {
+      drawPairingScreen();
+    }
+    else
+    {
+      // Exit: restore the BASIC display we hid.
+      fillBackground(bgColor);
+      redrawScreen();
+    }
     prevPairingMode = nowPairing;
+    lastCountdown = 0;
+  }
+  if (nowPairing)
+  {
+    unsigned long now = millis();
+    if (now - lastCountdown >= 500)
+    {
+      updatePairingCountdown(BleHidHost::pairingRemainingMs());
+      lastCountdown = now;
+    }
   }
 
   if (inputReady)
