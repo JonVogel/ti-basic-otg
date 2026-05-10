@@ -276,7 +276,11 @@ static inline void bleKbTask()
   }
   else if (millis() - disconnectAt > 5000)
   {
-    BleHidHost::requestPairingMode();
+    // Silent reconnect: kick off a scan window without raising the
+    // user-initiated flag, so a sleeping keyboard re-bonds without
+    // the application's pairing UI taking over the screen mid-
+    // BASIC-program.
+    BleHidHost::requestSilentScan();
     disconnectAt = 0;
   }
 }

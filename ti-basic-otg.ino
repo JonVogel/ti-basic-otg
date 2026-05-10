@@ -968,7 +968,7 @@ static void showBootScreen()
     while (!Serial.available() && !bleKbAvailable())
     {
       bleKbTask();
-      bool nowPair = BleHidHost::inPairingMode();
+      bool nowPair = BleHidHost::userInitiatedPairing();
       if (nowPair != prevPair)
       {
         if (nowPair)
@@ -1042,7 +1042,7 @@ static void showBootScreen()
     while (!Serial.available() && !bleKbAvailable())
     {
       bleKbTask();
-      bool nowPair = BleHidHost::inPairingMode();
+      bool nowPair = BleHidHost::userInitiatedPairing();
       if (nowPair != prevPair)
       {
         if (nowPair)
@@ -2352,7 +2352,11 @@ void loop()
   // BASIC display from screenBuf.
   static bool prevPairingMode = false;
   static unsigned long lastCountdown = 0;
-  bool nowPairing = BleHidHost::inPairingMode();
+  // Show takeover UI only for user-initiated pairing (BOOT / F12).
+  // Silent watchdog reconnects open the same scan window but keep
+  // userInitiatedPairing() = false, so a running BASIC program isn't
+  // interrupted just because the keyboard fell asleep.
+  bool nowPairing = BleHidHost::userInitiatedPairing();
   if (nowPairing != prevPairingMode)
   {
     if (nowPairing)

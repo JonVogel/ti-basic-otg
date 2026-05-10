@@ -62,12 +62,25 @@ public:
 
   // Safe to call from any context (BLE notify callbacks, ISRs, etc.).
   // The actual transition runs from task() on the main loop.
-  static void requestPairingMode() { _pairingRequested = true; }
+  // User-initiated pairing — opens the window AND flags it so the
+  // application shows a takeover UI. For silent watchdog
+  // reconnections, use requestSilentScan() instead.
+  static void requestPairingMode() { _userInitiatedRequested = true; _pairingRequested = true; }
   static void requestUnpairAll()   { _unpairRequested  = true; }
 
   static bool isConnected();
   static bool isReady();
   static bool inPairingMode()  { return _pairingMode; }
+  // True only when the user explicitly asked for pairing (BOOT
+  // button / F12), not when a silent watchdog reconnect kicked off a
+  // scan window. Lets the application show a full-screen pairing UI
+  // for user-initiated requests while keeping background reconnects
+  // invisible.
+  static bool userInitiatedPairing() { return _pairingMode && _userInitiatedPairing; }
+  // Request a *silent* scan window — same machinery, but the
+  // userInitiatedPairing() flag stays false so the application can
+  // skip any UI takeover.
+  static void requestSilentScan() { _pairingRequested = true; }
   // Milliseconds remaining in the current pairing window (0 if not
   // pairing).
   static unsigned long pairingRemainingMs()
@@ -97,6 +110,8 @@ private:
   static volatile bool _doScan;
   static volatile bool _pairingMode;
   static volatile bool _pairingRequested;
+  static volatile bool _userInitiatedRequested;
+  static volatile bool _userInitiatedPairing;
   static volatile bool _unpairRequested;
   static unsigned long _pairingDeadline;
   static uint32_t _pairingWindowMs;
@@ -133,8 +148,10 @@ inline BleHidHost::Peer BleHidHost::_peers[BleHidHost::MAX_PEERS];
 inline BleHidHost::ReportCallback BleHidHost::_cb = nullptr;
 inline volatile bool BleHidHost::_doScan            = false;
 inline volatile bool BleHidHost::_pairingMode       = false;
-inline volatile bool BleHidHost::_pairingRequested  = false;
-inline volatile bool BleHidHost::_unpairRequested   = false;
+inline volatile bool BleHidHost::_pairingRequested      = false;
+inline volatile bool BleHidHost::_userInitiatedRequested = false;
+inline volatile bool BleHidHost::_userInitiatedPairing  = false;
+inline volatile bool BleHidHost::_unpairRequested       = false;
 inline unsigned long BleHidHost::_pairingDeadline   = 0;
 inline uint32_t      BleHidHost::_pairingWindowMs   = 30000UL;
 
@@ -582,6 +599,12 @@ inline void BleHidHost::task()
   if (_pairingRequested)
   {
     _pairingRequested = false;
+    // Latch user-initiated flag at the time the window opens. Both
+    // BOOT-button-ISR and F12 set _userInitiatedRequested; the
+    // watchdog clears it before requesting via requestSilentScan()
+    // (which only sets _pairingRequested).
+    _userInitiatedPairing = _userInitiatedRequested;
+    _userInitiatedRequested = false;
     enterPairingMode(_pairingWindowMs);
   }
   if (_unpairRequested)
@@ -604,6 +627,7 @@ inline void BleHidHost::task()
   {
     Serial.println("BleHidHost: pairing window expired.");
     _pairingMode = false;
+    _userInitiatedPairing = false;
   }
 
   // Only scan while in pairing mode. Previously we also scanned
