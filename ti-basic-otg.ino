@@ -597,7 +597,7 @@ static void scrollUp()
   tft.fillRect(DISPLAY_X_OFFSET, y, COLS * CHAR_W, CHAR_H, bgColor);
 }
 
-static void printChar(char c)
+void tiPrintChar(char c)
 {
   // Mirror output to serial terminal for copy/paste
   Serial.write(c);
@@ -630,18 +630,18 @@ static void printChar(char c)
   cursorCol++;
 }
 
-static void printString(const char* str)
+void tiPrintString(const char* str)
 {
   while (*str)
   {
-    printChar(*str++);
+    tiPrintChar(*str++);
   }
 }
 
 static void printLine(const char* str)
 {
-  printString(str);
-  printChar('\n');
+  tiPrintString(str);
+  tiPrintChar('\n');
 }
 
 // TI-style error print: blank line, error message, blank line, plus a
@@ -654,7 +654,7 @@ static void printError(const char* str)
   Serial.write(0x07);
 }
 
-static void clearScreen()
+void tiClearScreen()
 {
   memset(screenBuf, ' ', COLS * ROWS);
   fillBackground(bgColor);
@@ -669,7 +669,7 @@ static void gfxPrepareInput()
 {
   if (cursorCol > 0)
   {
-    printChar('\n');
+    tiPrintChar('\n');
   }
 }
 
@@ -699,7 +699,7 @@ static void gfxReset()
 
 // Graphics callbacks for CALL HCHAR, VCHAR, GCHAR, SCREEN, COLOR
 
-static void gfxSetChar(int row, int col, char ch)
+void tiSetChar(int row, int col, char ch)
 {
   if (row < 0 || row >= ROWS || col < 0 || col >= COLS) return;
   screenBuf[row][col] = ch;
@@ -707,13 +707,13 @@ static void gfxSetChar(int row, int col, char ch)
   prevScreenBuf[row][col] = ch;
 }
 
-static char gfxGetChar(int row, int col)
+char tiGetChar(int row, int col)
 {
   if (row < 0 || row >= ROWS || col < 0 || col >= COLS) return 32;
   return screenBuf[row][col];
 }
 
-static void gfxSetScreenColor(int colorIdx)
+void tiSetScreenColor(int colorIdx)
 {
   if (colorIdx < 1 || colorIdx > 16) return;
   screenColorIdx = colorIdx;
@@ -728,7 +728,7 @@ static void gfxSetScreenColor(int colorIdx)
 //   Set 1 = chars 32-39, Set 2 = 40-47, ... Set 16 = 152-159
 // Move cursor to a specific position (for DISPLAY AT, ACCEPT AT).
 // row, col are 0-based.
-static void gfxMoveCursor(int row, int col)
+void tiMoveCursor(int row, int col)
 {
   if (row < 0) row = 0;
   if (row >= ROWS) row = ROWS - 1;
@@ -740,7 +740,7 @@ static void gfxMoveCursor(int row, int col)
 
 // CALL KEY: read one key from Serial or BLE keyboard without blocking.
 // Returns 0 if no key available, else the character code.
-static int gfxReadKey()
+int tiReadKey()
 {
   if (Serial.available())
   {
@@ -754,7 +754,7 @@ static int gfxReadKey()
 }
 
 // CALL CHAR: redefine a character's 8x8 bitmap pattern
-static void gfxSetCharPattern(int charCode, const uint8_t* pattern)
+void tiSetCharPattern(int charCode, const uint8_t* pattern)
 {
   if (charCode < 0 || charCode > 255) return;
   memcpy(charPatterns[charCode], pattern, 8);
@@ -772,7 +772,7 @@ static void gfxSetCharPattern(int charCode, const uint8_t* pattern)
 }
 
 // CALL CHARPAT: read a character's current 8×8 pattern
-static void gfxGetCharPattern(int charCode, uint8_t* out)
+void tiGetCharPattern(int charCode, uint8_t* out)
 {
   if (charCode < 0 || charCode > 255)
   {
@@ -784,7 +784,7 @@ static void gfxGetCharPattern(int charCode, uint8_t* out)
 
 // CALL CHARSET: reset characters 32-127 to their ROM default patterns.
 // Leaves user-defined graphics slots (128+) alone.
-static void gfxResetCharset()
+void tiResetCharset()
 {
   for (int i = 32; i < 128; i++)
   {
@@ -800,7 +800,7 @@ static void gfxResetCharset()
   }
 }
 
-static void gfxSetCharColor(int charSet, int fg, int bg)
+void tiSetCharColor(int charSet, int fg, int bg)
 {
   if (charSet < 1 || charSet > 16) return;
   if (fg < 1 || fg > 16) return;
@@ -1079,7 +1079,7 @@ static void showBootScreen()
   while (Serial.available()) { Serial.read(); delay(2); }
   while (bleKbAvailable())   { bleKbRead();  delay(2); }
 
-  clearScreen();
+  tiClearScreen();
 }
 
 static void showStatus(const char* msg)
@@ -1474,7 +1474,7 @@ static EditResult processEditChar(uint8_t c, LineEdit& s)
     cursorCol = s.startCol + s.len;
     if (cursorCol >= COLS) cursorCol = COLS - 1;
     cursorRow = s.startRow;
-    printChar('\n');
+    tiPrintChar('\n');
     editMode = EM_ENTRY;
     lastRecalledLineNum = -1;
     return EDIT_SUBMITTED;
@@ -1581,7 +1581,7 @@ static EditResult processEditChar(uint8_t c, LineEdit& s)
     if (idx < 0) { editEraseLine(s); return EDIT_CONTINUE; }
     if (idx > 0)
     {
-      printChar('\n');
+      tiPrintChar('\n');
       s.startCol = cursorCol;
       s.startRow = cursorRow;
       s.len = 0; s.pos = 0; s.buf[0] = '\0';
@@ -1620,7 +1620,7 @@ static EditResult processEditChar(uint8_t c, LineEdit& s)
     if (idx < 0) { editEraseLine(s); return EDIT_CONTINUE; }
     if (idx < em.programSize() - 1)
     {
-      printChar('\n');
+      tiPrintChar('\n');
       s.startCol = cursorCol;
       s.startRow = cursorRow;
       s.len = 0; s.pos = 0; s.buf[0] = '\0';
@@ -1788,7 +1788,7 @@ static void processInput(const char* input);
 static void cmdNew()
 {
   em.clearProgram();
-  clearScreen();
+  tiClearScreen();
   printLine("** READY **");
   showStatus("NEW program");
 }
@@ -1816,7 +1816,7 @@ static void cmdRun()
 
 static void cmdBye()
 {
-  clearScreen();
+  tiClearScreen();
   printLine("** GOODBYE **");
   delay(500);
   ESP.restart();
@@ -2105,11 +2105,11 @@ static bool shimFileRewind(int unit)
 // now these are no-ops so CALL SPRITE / CALL MOTION / CALL POSITION
 // etc. parse and update the sprite state without drawing anything.
 // CALL POSITION still returns coherent snapshot values.
-static void spriteStubDraw(int slot)  { (void)slot; }
-static void spriteStubErase(int slot) { (void)slot; }
+void tiSpriteDraw(int slot)  { (void)slot; }
+void tiSpriteErase(int slot) { (void)slot; }
 
 // --- CALL JOYST callback ---
-static void readJoystick(int unit, int* outX, int* outY)
+void tiReadJoystick(int unit, int* outX, int* outY)
 {
   *outX = bleGpJoystickX(unit);
   *outY = bleGpJoystickY(unit);
@@ -2276,7 +2276,7 @@ void setup()
     memset(prevScreenBuf[r], 0, COLS);
   }
 
-  clearScreen();
+  tiClearScreen();
 
   // Bring up BLE HID keyboard input BEFORE the boot screen so the scan
   // can start reconnecting while the user is still on the splash screens.
@@ -2290,19 +2290,14 @@ void setup()
   cursorRow = ROWS - 1;
   cursorCol = 0;
   printLine("* READY *");
-  printString(">");
+  tiPrintString(">");
 
-  // Connect display callbacks to the Token Parser
-  em.tp()->setCallbacks(printChar, printString, clearScreen);
+  // Graphics / sprite / input glue is provided via strong overrides
+  // of the weak tiXxx symbols declared in ti_platform.h — no
+  // setCallbacks needed for those. Language-layer callbacks (file I/O,
+  // command dispatch, throttle) still use explicit setCallbacks.
   em.tp()->setCommandCallbacks(cmdNew, cmdList, cmdRun, cmdSave,
                                cmdOld, cmdBye, cmdDir);
-  em.tp()->setGraphicsCallbacks(gfxSetChar, gfxGetChar,
-                                gfxSetScreenColor, gfxSetCharColor,
-                                gfxSetCharPattern);
-  em.tp()->setReadKey(gfxReadKey);
-  em.tp()->setMoveCursor(gfxMoveCursor);
-  em.tp()->setGetCharPattern(gfxGetCharPattern);
-  em.tp()->setResetCharset(gfxResetCharset);
   em.tp()->setCmdSize(cmdSize);
   em.tp()->setCmdTrace(cmdTrace);
   em.tp()->setCmdBreak(cmdBreak);
@@ -2315,10 +2310,6 @@ void setup()
                             shimFileReadLine, shimFileEof);
   em.tp()->setFileSeekRec(shimFileSeekRec);
   em.tp()->setFileRewind(shimFileRewind);
-  em.tp()->setReadJoystick(readJoystick);
-  // Sprite stubs — no rendering on the OTG ST7789 yet, but the
-  // language layer needs the callbacks to dispatch CALL SPRITE etc.
-  em.tp()->setSpriteCallbacks(spriteStubDraw, spriteStubErase);
   em.tp()->setThrottleCallback([](unsigned long us) {
     em.m_throttleUs = us;
     em.tp()->setThrottleUs(us);
@@ -2327,7 +2318,7 @@ void setup()
   em.setPrepareInput(gfxPrepareInput);
   em.setPrintLine(printLine);
   em.setPrintError(printError);
-  em.setPrintString(printString);
+  em.setPrintString(tiPrintString);
   em.setGetLine(getInputLine);
 
   char statusBuf[40];
@@ -2385,7 +2376,7 @@ void loop()
   if (inputReady)
   {
     processInput(inputBuf);
-    printString(">");
+    tiPrintString(">");
     inputPos = 0;
     inputReady = false;
   }
